@@ -1,0 +1,94 @@
+{
+  "_说明": "根据本地 PDF 文献库推荐 arXiv 相关文献。改完直接 python run.py 即可, 或运行 python ui.py 用图形界面。",
+  "ai": {
+    "provider": "anthropic",
+    "base_url": "https://chat.iphy.ac.cn/api",
+    "api_key": "",
+    "api_key_env": "ARXIV_REC_API_KEY",
+    "model": "deepseek-v4.1-flash",
+    "temperature": 0.3,
+    "max_tokens": 4096,
+    "timeout": 240,
+    "max_retries": 3,
+    "_说明": "provider 可选 openai(兼容 DeepSeek/Qwen/Kimi/智谱/本地vLLM等) 或 anthropic"
+  },
+  "arxiv": {
+    "queries": [],
+    "auto_queries": 18,
+    "per_query": 200,
+    "categories": [],
+    "max_candidates": 800,
+    "min_relevance": 0.3,
+    "request_delay": 5.0,
+    "fetch_details": false,
+    "_说明": "queries 留空则让 AI 根据你的文献库自动生成检索式。走官方 Atom API (一次请求拿完, 不翻页) + 各分类 RSS 公告; request_delay 是全局请求间隔, 别低于 3 秒",
+    "use_rss": true,
+    "rss_categories": []
+  },
+  "ranking": {
+    "weight_relevance": 0.6,
+    "weight_recency": 0.2,
+    "weight_importance": 0.2,
+    "recency_tau_days": 365.0,
+    "recency_hard_days": 1460.0,
+    "citation_scale": 200.0,
+    "famous_min_citations": 50,
+    "journal_ref_bonus": 0.15,
+    "venue_keywords": [
+      "phys. rev. lett",
+      "prl",
+      "nature",
+      "science",
+      "phys. rev. x",
+      "prx",
+      "nature physics",
+      "nature materials",
+      "pnas",
+      "npj",
+      "phys. rev. b",
+      "prb",
+      "quantum",
+      "scipost"
+    ],
+    "venue_bonus": 0.1,
+    "_说明": "score = w_rel*相关性 + w_rec*时效性 + w_imp*重要性，三者权重之和建议为 1"
+  },
+  "analysis": {
+    "top_n": 20,
+    "score_batch_size": 8,
+    "analyze_batch_size": 4,
+    "max_for_ai_scoring": 300,
+    "related_papers_k": 8,
+    "concurrency": 3
+  },
+  "network": {
+    "proxy": "http://127.0.0.1:7890",
+    "timeout": 40,
+    "retries": 5,
+    "cache": true,
+    "cache_dir": "cache",
+    "_说明": "proxy 填 null 直连；填 auto 读系统代理；或显式写 http://127.0.0.1:7890"
+  },
+  "output": {
+    "dir": "output",
+    "formats": [
+      "markdown"
+    ]
+  },
+  "pdf_folders": [
+    {
+      "path": "C:/Users/你的用户名/Zotero/storage",
+      "enabled": true,
+      "recursive": true
+    }
+  ],
+  "library": {
+    "index_db": "library_index.sqlite",
+    "fulltext_excerpt_chars": 3000,
+    "max_papers_for_profile": 200,
+    "concurrency": 4,
+    "skip_patterns": [],
+    "read_depth": "sections",
+    "_说明": "read_depth 三档: metadata=标题+摘要, sections=再加引言/结论(推荐), fulltext=再加全文节选。调深了会自动补读, 调浅了不重读"
+  }
+}

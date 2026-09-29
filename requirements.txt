@@ -1,0 +1,17 @@
+# 核心依赖 (必需)
+requests>=2.25
+
+# 读取 PDF 的标题/作者/摘要/引言/结论/正文节选 (arxiv_rec/pdf_library.py)。
+# 解析后端按 pymupdf -> pdfminer -> pypdf -> PyPDF2 依次降级, 装了哪个用哪个;
+# 一个都没有时整个文献库读不出来 —— 本地 PDF 是唯一的文献来源。
+PyMuPDF>=1.23
+
+# 用于关键词相似度与相关文献预筛。缺了程序照跑, 但相关性排序会退化成关键词
+# 重叠, 分数普遍挤在一起 —— 推荐质量掉一大截, 而且不会报任何错。
+scikit-learn>=0.24
+numpy>=1.19
+
+# --- 只有打包 exe 时才需要, 平时跑程序不用装 ---
+#   pip install pyinstaller && python build_exe.py --venv
+# --venv 会另建一个干净环境, 用 PyPI 的 wheel (OpenBLAS) 打包; 直接用当前
+# conda 环境打的话会把 Intel MKL 那 600 MB 一起带进去。
