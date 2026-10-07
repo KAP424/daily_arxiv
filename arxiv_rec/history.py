@@ -30,13 +30,13 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 from .config import project_root, resolve_path
 from .utils import extract_arxiv_id, log
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # 2 -> 1 之后加的五列 (authors/published/journal/categories/citations):
-# 「推荐记录」按钮现在把这张表**当成列表铺出来** (见 rows_as_candidates), 而
-# 只有标题、分数、时间的话, 那一排"作者/提交日期/期刊"全是破折号 —— 看着像坏
-# 了。这五列补上之后, 记录本身就能独立拼出列表, 不必再去翻当时的报告 (报告是
-# 会被删的)。
+# 「推荐记录」下拉框里选「全部累计记录」时会把这张表**当成列表铺出来** (见
+# rows_as_candidates), 而只有标题、分数、时间的话, 那一排"作者/提交日期/期刊"
+# 全是破折号 —— 看着像坏了。这五列补上之后, 记录本身就能独立拼出列表, 不必再去
+# 翻当时的报告 (报告是会被删的)。
 #
 # 迁移是**加列**而不是重建: 这张表存的是用户积累下来的推荐历史, 和索引那种
 # "删了重扫就有"的缓存不是一回事 —— 绝对不能照搬 pdf_library 里"版本变了就
@@ -71,6 +71,22 @@ CREATE TABLE IF NOT EXISTS recommended (
 );
 CREATE INDEX IF NOT EXISTS recommended_last ON recommended(last_at);
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
+-- v3 加的这张表: 和 AI 的**讨论记录** (见 chat.py)。一篇论文一段对话, 存在同一个
+-- sqlite 文件里 —— 讨论和推荐记录本来就是同一篇论文的两笔账, 分成两个文件只会
+-- 多出"拷走了记录却没拷走讨论"这种麻烦。
+--
+-- 单独一张表, 而不是往 recommended 里塞一列 JSON: 一条消息一行, 追加就是一次
+-- INSERT, 不必"整段读出来改一改再写回去"; 一篇聊了几十条也不会把主表撑胖。
+-- 这张表靠 CREATE TABLE IF NOT EXISTS 建, 老库打开时自然就有了 —— 它不涉及
+-- 已有表的改列, 所以 _migrate 那边不用管它。
+CREATE TABLE IF NOT EXISTS chat (
+    id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    arxiv_id TEXT NOT NULL,
+    role     TEXT NOT NULL DEFAULT '',   -- user / assistant
+    content  TEXT NOT NULL DEFAULT '',
+    at       TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS chat_paper ON chat(arxiv_id, id);
 """
 
 
@@ -106,7 +122,7 @@ def _json_list(text: Any) -> List[str]:
     return [str(x) for x in val if str(x).strip()]
 
 
-def _parse_dt(text: Any) -> Optional[datetime]:
+def parse_dt(text: Any) -> Optional[datetime]:
     """``published`` 那一列读回成 datetime。认不出来返回 None (不是报错)。"""
     text = str(text or "").strip()
     if not text:
@@ -293,6 +309,36 @@ class RecommendHistory:
             log("读取推荐记录失败: %s" % exc, "warn")
             return []
 
+    def chat_messages(self, arxiv_id: str,
+                      limit: int = 0) -> List[Dict[str, Any]]:
+        """某篇论文的讨论记录, 按先后顺序。``limit`` 只留最近几条。"""
+        aid = str(arxiv_id or "").strip()
+        if not aid:
+            return []
+        try:
+            rows = [dict(r) for r in self.conn.execute(
+                "SELECT role, content, at FROM chat WHERE arxiv_id = ? "
+                "ORDER BY id", (aid,))]
+        except Exception as exc:
+            log("读讨论记录失败 (%s): %s" % (aid, exc), "warn")
+            return []
+        if limit and limit > 0:
+            rows = rows[-int(limit):]
+        return rows
+
+    def chat_counts(self) -> Dict[str, int]:
+        """讨论记录的总体情况: 一共几条消息, 涉及几篇论文。"""
+        out = {"messages": 0, "papers": 0}
+        try:
+            row = self.conn.execute(
+                "SELECT COUNT(*) AS n, COUNT(DISTINCT arxiv_id) AS p FROM chat"
+            ).fetchone()
+            out["messages"] = int(row["n"] or 0)
+            out["papers"] = int(row["p"] or 0)
+        except Exception:
+            pass
+        return out
+
     # -- 写 ---------------------------------------------------------------
     def record(self, candidates: Iterable[Any], report_path: str = "",
                profile_fp: str = "") -> Tuple[int, int]:
@@ -400,6 +446,79 @@ class RecommendHistory:
             pass
         return n
 
+    def add_chat(self, arxiv_id: str, role: str, content: str) -> bool:
+        """往某篇论文的讨论里追加一条 (user / assistant)。"""
+        aid = str(arxiv_id or "").strip()
+        text = str(content or "")
+        if not aid or not text.strip():
+            return False
+        try:
+            self.conn.execute(
+                "INSERT INTO chat (arxiv_id, role, content, at) VALUES (?,?,?,?)",
+                (aid, str(role or ""), text,
+                 datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+            self.conn.commit()
+            return True
+        except Exception as exc:
+            log("写讨论记录失败 (%s): %s" % (aid, exc), "warn")
+            return False
+
+    def clear_chat(self, arxiv_id: str) -> int:
+        """删掉某篇论文的讨论, 返回删了几条。**只删这一段对话** —— 推荐记录里
+        的标题、分数、解读一概不动。"""
+        aid = str(arxiv_id or "").strip()
+        if not aid:
+            return 0
+        try:
+            cur = self.conn.execute("DELETE FROM chat WHERE arxiv_id = ?", (aid,))
+            self.conn.commit()
+            return int(cur.rowcount or 0)
+        except Exception as exc:
+            log("清空讨论记录失败 (%s): %s" % (aid, exc), "warn")
+            return 0
+
+    def save_analysis(self, arxiv_id: str, summary: str, connections: Any = None,
+                      ideas: str = "", profile_fp: str = "",
+                      title: str = "", report: str = "") -> bool:
+        """把一份**重新生成的解读**写进记录 (界面上的「用对话更新详解」)。
+
+        和 ``record`` 的分工: 那个是流水线跑完一轮时整批写 (顺带更新次数、分数、
+        时间), 这个是用户在界面上就着一篇论文点一下, 所以**只碰解读那几列** ——
+        次数、分数、时间一个字都不动。次数尤其不能动: 聊两句就把它加一, 用户会
+        看到"我只问了两个问题, 怎么推荐次数涨了"。
+
+        这篇论文不在记录里 (比如记录被清过, 而报告还在) 就补建一条, 否则这次更新
+        会悄无声息地丢掉。``profile_fp`` 照旧写进去 —— 下次跑推荐时, 这一篇的
+        解读就能按"画像没变"被复用, 不必再花一次 token。
+        """
+        aid = str(arxiv_id or "").strip()
+        if not aid:
+            return False
+        conns = json.dumps([dict(c) for c in (connections or [])
+                            if isinstance(c, dict)], ensure_ascii=False)
+        try:
+            cur = self.conn.execute(
+                """UPDATE recommended SET summary=?, connections=?, ideas=?,
+                   analyzed=1, profile_fp=? WHERE arxiv_id=?""",
+                (str(summary or ""), conns, str(ideas or ""),
+                 str(profile_fp or ""), aid))
+            if not (cur.rowcount or 0):
+                now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                self.conn.execute(
+                    """INSERT INTO recommended
+                       (arxiv_id, title, first_at, last_at, times, best_score,
+                        report, profile_fp, summary, connections, ideas, analyzed)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,1)""",
+                    (aid, str(title or ""), now, now, 1, 0.0, str(report or ""),
+                     str(profile_fp or ""), str(summary or ""), conns,
+                     str(ideas or "")))
+                log("这篇论文不在推荐记录里, 为它新建了一条 (%s)" % aid)
+            self.conn.commit()
+            return True
+        except Exception as exc:
+            log("写回解读失败 (%s): %s" % (aid, exc), "warn")
+            return False
+
     def forget(self, ids: Optional[List[str]] = None) -> int:
         cur = (self.conn.execute("DELETE FROM recommended") if not ids else
                self.conn.execute(
@@ -414,13 +533,26 @@ class RecommendHistory:
         删完补一次 VACUUM: 不清的话 sqlite 会把空页留在文件里, 界面上写着"已
         重置", 硬盘上那个文件却还是原来那么大 —— 用户按体积判断的时候会对不上。
 
+        **讨论记录一起删**: 那些对话是挂在"这篇论文的推荐记录"上的, 记录都没了,
+        它们在界面上就再也点不到 (得先有份报告把这篇论文重新铺出来), 留着只是
+        占地方。界面上那句确认把这一条写明了。
+
         只删记录, 不删报告、不动文献索引: 报告是用户自己的产物, 索引删了还得
         重扫。界面上那句确认写的就是这个范围。
         """
         n = self.forget()
         try:
-            self.conn.execute("VACUUM")
+            self.conn.execute("DELETE FROM chat")
+            # **这一步的 commit 不能省**: sqlite3 给 DML 自动开事务, 而 VACUUM
+            # 在事务里跑不了 —— 少了它, VACUUM 直接报 "cannot VACUUM from within
+            # a transaction", 而那条报错会被下面的 except 吞掉, 于是这次 DELETE
+            # 一直没提交; 连接一关, sqlite 把没提交的东西全部回滚, 结果就是
+            # "推荐记录清空了, 讨论却一条不少地留着" (自检里抓到过)。
             self.conn.commit()
+        except Exception as exc:
+            log("清空讨论记录失败: %s" % exc, "warn")
+        try:
+            self.conn.execute("VACUUM")
         except Exception as exc:               # VACUUM 失败不影响"记录已清空"
             log("整理推荐记录库失败: %s" % exc, "warn")
         return n
@@ -547,7 +679,7 @@ def rows_as_candidates(rows: List[Dict[str, Any]],
         c.connections = _conns(r.get("connections"))
         c.analyzed = bool(r.get("analyzed"))
         c.authors = _json_list(r.get("authors"))
-        c.published = _parse_dt(r.get("published"))
+        c.published = parse_dt(r.get("published"))
         c.journal_ref = str(r.get("journal") or "")
         c.categories = _json_list(r.get("categories"))
         if c.categories:
@@ -565,7 +697,7 @@ def rows_as_candidates(rows: List[Dict[str, Any]],
             if not c.authors and item.get("authors"):
                 c.authors = [str(item["authors"])]
             if c.published is None:
-                c.published = _parse_dt(item.get("date"))
+                c.published = parse_dt(item.get("date"))
             if not c.journal_ref and item.get("journal"):
                 c.journal_ref = str(item["journal"])
             if not c.categories and item.get("categories"):
@@ -585,7 +717,7 @@ def missing_meta_ids(rows: List[Dict[str, Any]]) -> List[str]:
     """哪些记录缺"作者/提交日期" —— 这两项 arXiv 一定有, 空着就说明确实缺。
 
     只看这两项, **不看期刊**: 一篇没发表过的论文本来就没有期刊, 拿它当"缺"会
-    让每次点「推荐记录」都去问一遍 arXiv, 还永远补不上。
+    让每次铺一遍记录都去问一遍 arXiv, 还永远补不上。
     """
     out: List[str] = []
     for r in rows:
@@ -608,7 +740,7 @@ def fill_missing_meta(cfg: Dict[str, Any], arxiv_ids: List[str],
     的时候, 用户看到的就是一排"——", 完全猜不到数据本来就在 arXiv 上。
 
     用的是抓候选时那套 ``search_by_ids`` (一次请求带 100 个 ID), 所以 20 条记录
-    只有一个请求, 而且走同一层磁盘缓存 —— 第二次点「推荐记录」根本不发请求。
+    只有一个请求, 而且走同一层磁盘缓存 —— 第二次铺一遍记录根本不发请求。
     """
     ids = [str(i).strip() for i in (arxiv_ids or []) if str(i or "").strip()]
     if not ids:
@@ -719,6 +851,89 @@ def load_records(cfg: Dict[str, Any], limit: int = 0) -> List[Any]:
     if not rows:
         return []
     return rows_as_candidates(rows, [report_dir(cfg)])
+
+
+# --------------------------------------------------------------------------
+# 讨论记录 (chat 表) 的读写入口
+#
+# 这几条**不看 analysis.use_history**: 那个开关管的是"跑完一轮要不要往记录里写
+# 推荐", 而讨论是用户在界面上当场敲的 —— 他敲了字, 东西就该存下来, 不该因为
+# 另一个不相干的开关而静默丢掉。
+# --------------------------------------------------------------------------
+def load_chat(cfg: Dict[str, Any], arxiv_id: str) -> List[Dict[str, Any]]:
+    """读某篇论文的讨论记录。库文件不在就直接返回空 —— **不建库** (看一眼不该
+    在用户盘上凭空多出一个文件, 和 load_rows 同一条规矩)。"""
+    aid = str(arxiv_id or "").strip()
+    path = history_path(cfg)
+    if not aid or not os.path.exists(path):
+        return []
+    try:
+        with RecommendHistory(path) as h:
+            return h.chat_messages(aid)
+    except Exception as exc:
+        log("读讨论记录失败: %s" % exc, "warn")
+        return []
+
+
+def append_chat(cfg: Dict[str, Any], arxiv_id: str, role: str,
+                content: str) -> bool:
+    """追加一条讨论 (没有库就建一个)。"""
+    aid = str(arxiv_id or "").strip()
+    if not aid or not str(content or "").strip():
+        return False
+    try:
+        with RecommendHistory(history_path(cfg)) as h:
+            return h.add_chat(aid, role, content)
+    except Exception as exc:
+        log("写讨论记录失败: %s" % exc, "warn")
+        return False
+
+
+def clear_chat(cfg: Dict[str, Any], arxiv_id: str) -> int:
+    """删掉某篇论文的讨论, 返回删了几条。"""
+    aid = str(arxiv_id or "").strip()
+    path = history_path(cfg)
+    if not aid or not os.path.exists(path):
+        return 0
+    try:
+        with RecommendHistory(path) as h:
+            return h.clear_chat(aid)
+    except Exception as exc:
+        log("清空讨论记录失败: %s" % exc, "warn")
+        return 0
+
+
+def save_analysis(cfg: Dict[str, Any], cand: Any, profile_fp: str = "",
+                  report: str = "") -> bool:
+    """把候选对象上现有的解读写回记录库 (见 RecommendHistory.save_analysis)。"""
+    aid = str(getattr(cand, "arxiv_id", "") or "").strip()
+    if not aid:
+        return False
+    try:
+        with RecommendHistory(history_path(cfg)) as h:
+            return h.save_analysis(
+                aid, getattr(cand, "summary", "") or "",
+                getattr(cand, "connections", None) or [],
+                getattr(cand, "ideas", "") or "", profile_fp,
+                title=getattr(cand, "title", "") or "",
+                report=report or str(getattr(cand, "record_report", "") or ""))
+    except Exception as exc:
+        log("写回解读失败: %s" % exc, "warn")
+        return False
+
+
+def chat_summary(cfg: Dict[str, Any]) -> str:
+    """给自检/日志用的一句话。"""
+    path = history_path(cfg)
+    if not os.path.exists(path):
+        return "讨论记录: 还没有"
+    try:
+        with RecommendHistory(path) as h:
+            c = h.chat_counts()
+            return ("讨论记录: %d 条消息, 涉及 %d 篇论文"
+                    % (c["messages"], c["papers"]))
+    except Exception as exc:
+        return "讨论记录: 打不开 (%s)" % exc
 
 
 def open_history(cfg: Dict[str, Any],

@@ -33,7 +33,18 @@ def check(name, cond, detail=""):
 
 
 def reply_for(user_text):
-    """按提示词里的 schema 关键字决定回什么。"""
+    """按提示词里的 schema 关键字决定回什么。
+
+    ``user_text`` 是**全部 messages 拼起来的** —— 系统提示词也在里面, 所以能靠
+    "继续讨论" 这种字样认出这是 chat.py 发来的那一类请求。
+    """
+    # 和 AI 逐篇讨论 (chat.py 的 CHAT_SYSTEM 里写着"这是一场…继续讨论"): 要的是
+    # **纯文字**回答, 不是 JSON —— 返回字符串, 下面 handler 就不套围栏了。
+    # "用对话更新详解"那次提示词里带着 ANALYZE_SCHEMA (含 "connections"), 所以
+    # 排除掉它, 让它落到下面那个 JSON 分支去。
+    if "继续讨论" in user_text and '"connections"' not in user_text:
+        return ("假服务: 它先做了一个规范变换, 把符号问题转成可解的本征值问题, "
+                "附录 B 里给了构造和数值验证。")
     if '"scores"' in user_text:
         ids = re.findall(r'"id":\s*"([^"]+)"', user_text)
         scores = [{"id": i, "score": 80 - (n % 40),
@@ -72,8 +83,11 @@ class Handler(BaseHTTPRequestHandler):
         user_text = "\n".join(m.get("content", "") for m in body.get("messages", []))
         CALLS.append(self.path)
         payload = reply_for(user_text)
-        # 故意包一层 ```json 围栏, 顺带验 safe_json_loads 剥围栏
-        text = "```json\n" + json.dumps(payload, ensure_ascii=False) + "\n```"
+        if isinstance(payload, str):
+            text = payload              # 聊天要的就是一段人话, 不套 JSON 围栏
+        else:
+            # 故意包一层 ```json 围栏, 顺带验 safe_json_loads 剥围栏
+            text = "```json\n" + json.dumps(payload, ensure_ascii=False) + "\n```"
         out = json.dumps({
             "id": "mock", "object": "chat.completion",
             "choices": [{"index": 0, "finish_reason": "stop",
@@ -242,6 +256,103 @@ check("第二次运行真的走了 AI 缓存 (而不是全靠推荐记录复用)
       "命中缓存 %d 次, 日志: %s" % (len(_hits), _hits[:3]))
 check("第二次运行仍有推荐结果", len(res2.top) == len(res.top),
       "%d vs %d" % (len(res2.top), len(res.top)))
+
+print()
+print("=" * 70)
+print("和 AI 逐篇讨论 (chat.py): 真 HTTP 客户端走一遍, 再写回记录")
+print("=" * 70)
+# 前面验的是流水线里的"一次性解读"; 这一节验的是**接着往下聊**: 提示词拼得对不对
+# (画像 + 相关文献标签 + 这篇论文 + 已有解读)、回答走的是纯文字而不是 JSON、
+# "用对话更新详解"给回来的关联仍然要过标签校验、以及这些字最后落在哪。
+from arxiv_rec import chat as _chat
+from arxiv_rec import history as _hist
+from arxiv_rec.ai import build_client
+from arxiv_rec.models import Candidate as _Cand
+from arxiv_rec.models import LibraryPaper as _Paper
+
+_ai = build_client(c, None)
+_hdb = cfg["analysis"]["history_db"]
+_hcfg = {"analysis": {"history_db": _hdb, "use_history": True}}
+
+_papers = [_Paper(item_id=1, key="k1", title="Sign problem in determinant QMC",
+                  abstract="Majorana positivity and the sign problem",
+                  year=2020, authors=["Wei Wang"], arxiv_id="2001.00001"),
+           _Paper(item_id=2, key="k2", title="Reassessing the Pfaffian sign",
+                  abstract="Pfaffian sign problem in lattice models",
+                  year=2019, authors=["Li Chen"], arxiv_id="1901.00001")]
+
+_talk = _Cand(arxiv_id="2401.90001",
+              title="A sign-problem-free reformulation for lattice fermions",
+              abstract="We reformulate the sign problem via a canonical "
+                       "transformation and validate numerically.")
+_talk.summary = "流水线给出的旧解读。"
+_talk.ideas = "旧的方向。"
+_talk.connections = [{"paper": "Wang 2020", "relation": "方法同源"}]
+
+_prefix, _labels = _chat.build_context({"analysis": {}}, _talk, papers=_papers)
+check("讨论的上下文里有这篇论文", "sign-problem-free reformulation" in _prefix)
+check("讨论的上下文里有可引用的文献标签", bool(_labels), _labels)
+check("讨论的上下文里带着已有的解读 (从它接着往下, 不重复讲)",
+      "流水线给出的旧解读。" in _prefix)
+
+_before = len(CALLS)
+_msgs = [{"role": "user", "content": "它的符号问题是怎么绕过去的?"},
+         {"role": "assistant", "content": "先做规范变换, 再验证。"}]
+_ans = _chat.reply(_ai, _prefix, _msgs, "这个变换在小格点上还成立吗?")
+check("追问拿到了回答", bool(_ans), repr(_ans[:60]))
+check("回答是**纯文字**, 不是 JSON (聊天不该被 JSON 围栏包住)",
+      "假服务: 它先做了一个规范变换" in _ans and "```" not in _ans, _ans[:80])
+check("这一问只调了一次 AI", len(CALLS) == _before + 1, len(CALLS) - _before)
+
+# 同一段提示词再问一次: 还是得真调一次 —— 讨论刻意不走 AI 缓存 (缓存按提示词
+# 逐字做键, 这里每问一句提示词都不同, 命中率极低却会把整场问答都留在盘上)。
+_before2 = len(CALLS)
+_chat.reply(_ai, _prefix, _msgs, "这个变换在小格点上还成立吗?")
+check("讨论不吃 AI 缓存 (同样的问法也真打一次接口)",
+      len(CALLS) == _before2 + 1, len(CALLS) - _before2)
+
+_got = _chat.rewrite_analysis(_ai, _prefix, _msgs, _labels)
+check("重写详解拿到了 summary", bool(_got.get("summary")), _got.get("summary"))
+check("重写详解拿到了 ideas", bool(_got.get("ideas")), _got.get("ideas"))
+check("重写详解的关联标签来自文献库 (编出来的会被丢掉)",
+      bool(_got.get("connections"))
+      and all(cn["paper"] in _labels for cn in _got["connections"]),
+      (_got.get("connections"), _labels))
+
+# --- 存: 讨论按论文存, 解读只碰解读那几列 ---
+_hist.append_chat(_hcfg, "2401.90001", "user", "它的符号问题是怎么绕过去的?")
+_hist.append_chat(_hcfg, "2401.90001", "assistant", _ans)
+check("讨论存进去了",
+      [m["role"] for m in _hist.load_chat(_hcfg, "2401.90001")]
+      == ["user", "assistant"],
+      _hist.load_chat(_hcfg, "2401.90001"))
+
+with _hist.RecommendHistory(_hdb) as _h:
+    _h.record([_Cand(arxiv_id="2401.90001", title=_talk.title, score=0.77)],
+              profile_fp="fp-before")
+_row0 = {r["arxiv_id"]: r for r in _hist.load_rows(_hcfg)}["2401.90001"]
+_talk.summary, _talk.ideas = _got["summary"], _got["ideas"]
+_talk.connections = _got["connections"]
+_talk.analyzed = True
+check("写回详解成功", _hist.save_analysis(_hcfg, _talk, "fp-after"))
+_row1 = {r["arxiv_id"]: r for r in _hist.load_rows(_hcfg)}["2401.90001"]
+check("详解写进了记录库", _row1["summary"] == _got["summary"], _row1["summary"])
+check("写回详解**没有**动推荐次数 (用户没跑推荐, 只是聊了聊)",
+      _row1["times"] == _row0["times"], (_row0["times"], _row1["times"]))
+check("写回详解没有动最后推荐时间",
+      _row1["last_at"] == _row0["last_at"],
+      (_row0["last_at"], _row1["last_at"]))
+check("讨论和解读互不干扰 (聊完还在, 写完也还在)",
+      len(_hist.load_chat(_hcfg, "2401.90001")) == 2
+      and bool(_row1["summary"]))
+# 写回去的解读带着新的画像指纹 -> 下一轮跑推荐时能直接复用, 不再花 token
+_c_reuse = _Cand(arxiv_id="2401.90001", title=_talk.title)
+check("写回的解读下一轮能被复用 (画像没变)",
+      _hist.RecommendHistory.reuse_analysis(_c_reuse, _row1, "fp-after")
+      and _c_reuse.summary == _got["summary"], _c_reuse.summary)
+check("画像变了就不复用",
+      not _hist.RecommendHistory.reuse_analysis(
+          _Cand(arxiv_id="2401.90001", title=_talk.title), _row1, "fp-别的"))
 
 srv.shutdown()
 shutil.rmtree(tmpdir, ignore_errors=True)

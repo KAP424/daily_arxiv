@@ -43,13 +43,37 @@ from .pipeline import (PipelineCallbacks, PipelineOptions, build_caches,
 from .theme import LEVEL_COLORS
 from .utils import (add_log_sink, fmt_authors, fmt_date, fmt_journal,
                     fmt_journal_ref, log, remove_log_sink,
-                    reset_proxy_probe_cache)
+                    reset_proxy_probe_cache, truncate)
 
 POLL_MS = 120
 
 # 「文献列表」页下拉框里的第一个选项: 看本地已读文献。其余选项都是某一次的历史
 # 推荐结果 (标签里带时间, 见 past_runs.label_for)。
 RUN_LIBRARY = "已读文献 (本地 PDF)"
+
+# 「文献推荐」页那个"推荐记录"下拉框的两个**固定**选项, 中间夹着的全是某一次的
+# 历史推荐 (标签同样来自 past_runs.label_for):
+#   * 本次运行的结果 —— 这一轮刚跑出来的那张列表 (跑之前是空的)
+#   * 全部累计记录 (N 篇) —— 记录库里所有推荐过的论文, 按时间排; 就是以前那个
+#     「推荐记录」按钮干的事, 现在挪进下拉框里当一个选项
+REC_LIVE = "本次运行的结果"
+# 末尾带篇数, 所以是**前缀**而不是整串 —— 判断"选的是不是这一项"要用 startswith
+# (见 _apply_rec_pick)。
+REC_ALL_PREFIX = "全部累计记录 ("
+
+
+def _apply_chat_analysis(cand: Any, got: Dict[str, Any]) -> None:
+    """把"按讨论重写的详解"落到候选对象上 (就地改)。
+
+    和 analyze._apply 是同一件事的两个入口, 但**不复用**那个: 那个是流水线批量
+    解读时用的, 还要兼顾"复用旧解读"的标记; 这里是用户在界面上点了一下, 语义
+    简单 —— 就是"这三项换新的", 顺手把 reused 清掉 (它不再是复用的旧解读了)。
+    """
+    cand.summary = str(got.get("summary") or "")
+    cand.connections = list(got.get("connections") or [])
+    cand.ideas = str(got.get("ideas") or "")
+    cand.analyzed = bool(cand.summary or cand.ideas)
+    cand.reused = False
 
 
 def _ui_font(root: tk.Misc) -> str:
@@ -253,6 +277,28 @@ class App(tk.Tk):
         # 它是顺手做的补全, 不该让 _busy() 变成真 —— 那会把"跑一轮推荐"锁住,
         # 用户会因为一个正在后台补日期的动作而点不动主按钮。
         self._meta_thread: Optional[threading.Thread] = None
+
+        # --- 「推荐记录」下拉框 (见 _build_recommend_tab / _on_rec_pick) ---
+        # 跑过三轮就该能挑看哪一轮, 而不是把三轮混成一张按时间排的大表。
+        self._rec_runs: List[Dict[str, Any]] = []
+        # 下拉框现在显示的是哪一类: "live" (这一轮) / "run" (某一份历史报告) /
+        # "all" (全部累计记录)。清空记录、跑完一轮这些动作都要看它一眼。
+        self._rec_mode = "live"
+        # 这一轮跑出来的结果, 单独留一份 —— 从历史报告切回"本次运行的结果"时
+        # 要原样还回来, 不能靠重跑一遍。
+        self._live_ranked: List[Any] = []
+        self._live_top_ids: set = set()
+
+        # --- 和 AI 的讨论 (见 _build_chat_pane) ---
+        self._chat_paper: Any = None            # 讨论区现在对着哪一篇
+        self._chat_msgs: List[Dict[str, Any]] = []   # 界面上正显示的对话
+        self._chat_busy_aid = ""                # 正在等 AI 回复的是哪一篇
+        self._chat_thread: Optional[threading.Thread] = None
+        # 提示词前缀按论文缓存 (拼一次要读文献库 + 算 TF-IDF, 每问一句都重算
+        # 太亏)。"用对话更新详解"之后要清掉 —— 那份前缀里含旧的详解。
+        self._chat_ctx: Dict[str, Any] = {}
+        self._chat_papers: Optional[List[Any]] = None   # 文献库列表, 拼上下文用
+
         self.papers: List[Any] = []
         self._current_job = ""
         # 读取深度必须在这里建: 读取页和推荐页各有一份控件, 而两者共用这一个
@@ -313,11 +359,20 @@ class App(tk.Tk):
         # 于是它们就落在 exe 旁边, 整个文件夹拷到别的机器上记录和报告都跟着走。
         self._ensure_config_file()
         self.nb.bind("<<NotebookTabChanged>>", lambda e: self._on_tab_changed())
+        # Ctrl + 滚轮 = 滚整页 (见 _bind_ctrl_wheel)。全局挂一次就够 —— 它按控件
+        # **类**挂, 和建了几个页面无关; 放进 _scrollable 里每建一页挂一次的话,
+        # 一次滚轮会滚好几格。
+        self._bind_ctrl_wheel()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         add_log_sink(self._log_sink)
         self.after(POLL_MS, self._poll)
         # 等窗口画出来再弹路径提醒 (构造到一半弹对话框, 后面的控件会画在它上面)
         self.after(400, self._check_data_paths)
+        # 推荐记录下拉框要在**开程序时就有东西可选**: 只读 Combobox 的 values 是
+        # 空的, 用户看到的就是一个空白框, 得先点一下「重新扫描」才知道里面能有
+        # 什么。放到 400ms 之后: 它要读 output/ 下的历史报告, 别和窗口的第一次
+        # 绘制抢时间。
+        self.after(400, self._reload_rec_runs)
 
     # ------------------------------------------------------------------
     # 顶栏
@@ -531,14 +586,27 @@ class App(tk.Tk):
         self.btn_report = ttk.Button(act, text="打开报告", command=self.open_report,
                                      state="disabled")
         self.btn_report.pack(side="left")
-        # 这两个是**两件事**, 刻意分成两个按钮: 「推荐记录」是"把记录铺到下面
-        # 那张列表里看", 「删除推荐记录」才是清空。以前它们挤在同一个按钮上
-        # (点"推荐记录"看完弹窗, 关掉前问一句要不要清空), 结果想翻一眼记录的人
-        # 每次都得先绕过一次删除确认 —— 看和删本来就不该共用一次点击。
-        ttk.Button(act, text="推荐记录", command=self.load_history
-                   ).pack(side="left", padx=8)
-        ttk.Button(act, text="删除推荐记录", style="Quiet.TButton",
-                   command=self.clear_history).pack(side="left")
+
+        # --- 推荐记录: 看哪一次 ---
+        # 以前这是个按钮, 点一下把**整库**铺到下面的列表里。跑过三轮之后, 想看
+        # 的是"第二轮推荐了什么", 而那个按钮只会把三轮混成一张按时间排的大表。
+        # 现在换成下拉框: 一次运行一个选项 (标签带时间, 见 past_runs.label_for),
+        # 选哪个下面就铺哪个。老行为没丢 —— 它是最后那个"全部累计记录"。
+        #
+        # 「删除推荐记录」仍然单独一个按钮: 看和删共用一次点击的话, 想翻一眼记录
+        # 的人每次都得先绕过一次删除确认。
+        rec = ttk.Frame(t)
+        rec.pack(side="top", fill="x", padx=8, pady=(6, 0))
+        ttk.Label(rec, text="推荐记录").pack(side="left")
+        self.var_rec_run = tk.StringVar(value=REC_LIVE)
+        self.cmb_rec_run = ttk.Combobox(rec, textvariable=self.var_rec_run,
+                                        state="readonly", width=56)
+        self.cmb_rec_run.pack(side="left", padx=(4, 8))
+        self.cmb_rec_run.bind("<<ComboboxSelected>>", self._on_rec_pick)
+        ttk.Button(rec, text="重新扫描", command=self.refresh_rec_runs
+                   ).pack(side="left")
+        ttk.Button(rec, text="删除推荐记录", style="Quiet.TButton",
+                   command=self.clear_history).pack(side="left", padx=8)
 
         pf = ttk.Frame(t)
         pf.pack(side="top", fill="x", padx=8, pady=(10, 2))
@@ -616,8 +684,81 @@ class App(tk.Tk):
         # 哪一种, 所以中间隔一层 _on_detail_configure。
         self.txt_detail.bind("<Configure>", self._on_detail_configure)
 
+        self._build_chat_pane(t)
+
         # 详解**不**进这个名单: 它现在自己不带滚动条, 滚轮在它上面就该滚整页。
-        self._wheel_passthrough(page, self.tree, self.txt_run_log)
+        # 对话区要进: 它是个定高、自带滚动条的框, 滚轮在它上面得翻对话。
+        self._wheel_passthrough(page, self.tree, self.txt_run_log, self.txt_chat)
+
+    # ------------------------------------------------------------------
+    # 和 AI 深入讨论某一篇
+    #
+    # 详解是"AI 一次性给出的解读", 讨论是"就着这篇论文往下聊"。两者刻意分开:
+    #   * 聊完**不会**自动重写详解 —— 聊十句攒下的理解, 什么时候落进详解由用户
+    #     决定 (那个「用对话更新详解」按钮)。每聊一句就重写一遍的话, 用户会看到
+    #     详解在脚下不断变形, 而且每问一句都要多花一次 AI 调用。
+    #   * 讨论本身存在这篇论文的记录里 (history.py 的 chat 表), 换一篇再换回来
+    #     还在, 关掉程序也还在。
+    # ------------------------------------------------------------------
+    def _build_chat_pane(self, t: tk.Misc) -> None:
+        box = ttk.LabelFrame(t, text="和 AI 深入讨论这篇 "
+                                     "(选中列表里的一篇, 在下面接着追问)")
+        box.pack(side="top", fill="x", padx=8, pady=(0, 8))
+
+        head = ttk.Frame(box)
+        head.pack(side="top", fill="x", padx=8, pady=(6, 2))
+        self.var_chat_paper = tk.StringVar(value="还没有选中论文")
+        ttk.Label(head, textvariable=self.var_chat_paper,
+                  style="CardMuted.TLabel").pack(side="left")
+        # 「更新详解」用 Accent 描出来: 它是这一块里**唯一会改数据**的动作
+        # (会写进推荐记录), 其余几个都只是看或清。
+        self.btn_chat_detail = ttk.Button(head, text="用对话更新详解",
+                                          style="Accent.TButton",
+                                          command=self.update_detail_from_chat)
+        self.btn_chat_detail.pack(side="right")
+        # CardQuiet 而不是 Quiet: 这一块是**卡片**(白底), 而 Quiet.TButton 的
+        # 底色是页面灰 —— 摆进去就是白卡片上的一块灰方块 (自检的底色检查抓过)。
+        self.btn_chat_clear = ttk.Button(head, text="清空这段对话",
+                                         style="CardQuiet.TButton",
+                                         command=self.clear_chat)
+        self.btn_chat_clear.pack(side="right", padx=8)
+
+        body = ttk.Frame(box)
+        body.pack(side="top", fill="both", expand=True, padx=8, pady=(0, 2))
+        # 定高 + 自己的滚动条 (和运行日志一个道理): 讨论可以很长, 但它不该把
+        # 整页越撑越高。
+        self.txt_chat = tk.Text(body, height=12, wrap="word", state="disabled",
+                                background=theme.SURFACE, relief="flat",
+                                highlightthickness=0, padx=10, pady=6,
+                                font=(self.font_name, 10), spacing1=1, spacing3=2)
+        cys = ttk.Scrollbar(body, orient="vertical", command=self.txt_chat.yview)
+        self.txt_chat.configure(yscrollcommand=cys.set)
+        self.txt_chat.pack(side="left", fill="both", expand=True)
+        cys.pack(side="right", fill="y")
+        self.txt_chat.tag_configure("who_user", foreground=theme.ACCENT_DARK,
+                                    font=(self.font_name, 10, "bold"),
+                                    spacing1=6)
+        self.txt_chat.tag_configure("who_ai", foreground=theme.ACCENT,
+                                    font=(self.font_name, 10, "bold"),
+                                    spacing1=6)
+        self.txt_chat.tag_configure("msg", lmargin1=4, lmargin2=14, spacing3=2)
+        self.txt_chat.tag_configure("sys", foreground=theme.MUTED,
+                                    lmargin1=4, lmargin2=4, spacing1=4)
+
+        inp = ttk.Frame(box)
+        inp.pack(side="top", fill="x", padx=8, pady=(2, 4))
+        self.var_chat_in = tk.StringVar()
+        self.ent_chat = ttk.Entry(inp, textvariable=self.var_chat_in)
+        self.ent_chat.pack(side="left", fill="x", expand=True)
+        self.ent_chat.bind("<Return>", lambda e: self.send_chat())
+        self.btn_chat_send = ttk.Button(inp, text="发送", style="Accent.TButton",
+                                        command=self.send_chat)
+        self.btn_chat_send.pack(side="left", padx=(6, 0))
+        ttk.Label(box, text="回车发送。讨论会存在这篇论文的记录里; 想让它变成详解, "
+                            "点右上角「用对话更新详解」—— 不会每聊一句就自动改详解。",
+                  style="CardMuted.TLabel", wraplength=1100,
+                  justify="left").pack(side="top", anchor="w", padx=10, pady=(0, 6))
+        self._render_chat()
 
     # ------------------------------------------------------------------
     # "详解"面板的高度: 按内容撑开, 自己不滚动
@@ -1838,6 +1979,13 @@ class App(tk.Tk):
         # canvas 的窗口项钉住的 —— 请求高度变了、实际尺寸没变, <Configure> 不
         # 一定发得出来。所以留个手动入口给那种情况用。
         inner.refit_page = _on_inner
+        # 往上找"这一页最外侧的滚动容器"的路标 (见 _bind_ctrl_wheel): Ctrl+滚轮
+        # 时从指针底下那个控件顺着 master 一路上去, 第一个带这个属性的就是本页。
+        # canvas 也挂一份**指着自己**: 内层 Frame 虽然被顶到视口高度、把 canvas
+        # 整个盖住, 但窗口正在缩放的那几拍里指针还是可能落在 canvas 自己身上,
+        # 而那时候从它往上走是找不到 inner 的。
+        canvas.page_canvas = canvas
+        inner.page_canvas = canvas
         return inner
 
     def _wheel_passthrough(self, page: tk.Misc, *widgets: tk.Widget) -> None:
@@ -1845,6 +1993,63 @@ class App(tk.Tk):
         for w in widgets:
             w.bind("<Enter>", lambda e, p=page: p.release_page_wheel(), add="+")
             w.bind("<Leave>", lambda e, p=page: p.bind_page_wheel(), add="+")
+
+    # ------------------------------------------------------------------
+    # Ctrl + 滚轮 = 滚整页
+    # ------------------------------------------------------------------
+    def _bind_ctrl_wheel(self) -> None:
+        """让 Ctrl + 滚轮滚**整页**那个滚动条, 而不是指针底下那个小框。
+
+        为什么按控件类挂, 而不是像普通滚轮那样挂到 "all" 上?
+
+        实测 (Tk 8.6.9 / win32): 按住 Ctrl 时 ``<MouseWheel>`` **照样匹配** ——
+        Tk 允许事件带上模式里没写的修饰键。所以指针停在结果表上按 Ctrl 滚, 表格
+        自己的类绑定先跑、先把表格滚掉一格, 才轮到 "all" 上那个整页绑定, 两边
+        一起动。而 ``<Control-MouseWheel>`` 和 ``<MouseWheel>`` 挂在**同一个** tag
+        上时, Tk 只挑更具体的那个跑 (修饰键多的胜), 它再 ``break`` 一下, 同一个
+        tag 里后面的绑定就整条不跑了 —— 于是表格纹丝不动, 滚的只有整页。
+
+        Text 和 Treeview 是本程序里**仅有的**两种自带滚动条的控件 (结果表、文件夹
+        表、运行日志、对话区、详解框); 指针在别处 (卡片空白、按钮、输入框) 本来
+        也没有第二个滚动条, "all" 上那个整页绑定照常生效, 带不带 Ctrl 都一样。
+        uitest 里有一条断言专门盯着这句话 —— 将来谁往页面里塞一个自带滚动条的
+        新控件类, 那条会先挂, 而不是让 Ctrl+滚轮在它上面悄悄失灵。
+
+        不写 ``add="+"``: 这两个类在 Tk 里本来就没有 ``<Control-MouseWheel>`` 绑定
+        (实测是空串), 直接覆盖既不丢东西, 重复调用也只会覆盖一次 —— 而 ``add``
+        会**追加**, 挂两回就一次滚两格。
+        """
+        for cls in ("Text", "Treeview"):
+            self.bind_class(cls, "<Control-MouseWheel>", self._ctrl_wheel)
+
+    def _ctrl_wheel(self, event: Any) -> Optional[str]:
+        """Ctrl + 滚轮: 滚当前这一页最外侧那个滚动条 (见 _bind_ctrl_wheel)。
+
+        找不到整页容器就返回 ``None`` (**不** break), 让控件按老规矩滚自己 ——
+        「文献列表」页就是这种情况: 那一页没有整页滚动容器, 最外侧的滚动条**就是**
+        那张表自己的, 它自己滚正是对的。
+        """
+        canvas = self._outermost_canvas(event.widget)
+        if canvas is None:
+            return None
+        canvas.yview_scroll(-1 if event.delta > 0 else 1, "units")
+        return "break"
+
+    def _outermost_canvas(self, widget: tk.Misc) -> Optional[tk.Canvas]:
+        """顺着 ``widget`` 的 master 往上找本页最外侧那个滚动容器 (见 _scrollable)。
+
+        用事件自带的 ``event.widget``, 而不是"记住指针进过哪一页": 滚轮事件本来就
+        是发给**指针底下**那个控件的 (整页滚轮那套绑定靠的也是这一条), 所以往上走
+        遇到的第一个带 ``page_canvas`` 的祖先, 正好是用户正看着的那一页 —— 切标签
+        页、切子页面都不用另外记账, 也不会有"记下的那一页已经不在屏幕上了"这种事。
+        """
+        w: Optional[tk.Misc] = widget
+        while w is not None:
+            canvas = getattr(w, "page_canvas", None)
+            if canvas is not None:
+                return canvas
+            w = getattr(w, "master", None)
+        return None
 
     def _row(self, parent: ttk.Frame, r: int, label: str, widget: tk.Widget) -> None:
         ttk.Label(parent, text=label, width=12, anchor="e").grid(
@@ -2253,6 +2458,17 @@ class App(tk.Tk):
                     self._on_quick_fail(msg[1], msg[2])
                 elif kind == "meta":
                     self._on_meta_repaired(msg[1])
+                # --- 和 AI 的讨论 (见 send_chat / update_detail_from_chat) ---
+                elif kind == "chat_ok":
+                    self._on_chat_reply(msg[1], msg[2])
+                elif kind == "chat_err":
+                    self._on_chat_fail(msg[1], msg[2])
+                elif kind == "chat_meta":
+                    self._on_chat_meta(msg[1])
+                elif kind == "chat_detail":
+                    self._on_chat_detail(msg[1], msg[2])
+                elif kind == "chat_detail_err":
+                    self._on_chat_detail_fail(msg[1], msg[2])
         except queue.Empty:
             pass
         self.after(POLL_MS, self._poll)
@@ -2396,8 +2612,192 @@ class App(tk.Tk):
                      "换档位时: 往深调只补读缺的部分, 往浅调直接复用旧结果。")
         messagebox.showinfo("已读记录", "\n".join(lines))
 
+    # ------------------------------------------------------------------
+    # 推荐记录下拉框: 挑看哪一次
+    # ------------------------------------------------------------------
+    def refresh_rec_runs(self) -> None:
+        """「重新扫描」: 把输出目录里的报告重新读一遍, 再按当前选择重铺列表。"""
+        self._collect_into_cfg()
+        self._reload_rec_runs()
+        self._apply_rec_pick()
+
+    def _reload_rec_runs(self) -> None:
+        """重扫输出目录, 更新下拉框的选项; **不**改下面那张列表。
+
+        保留用户当前选中的那一项 (按标签比对): 只是刷新一下选项, 不该把人家正在
+        看的东西换掉。选中的那一份报告已经从磁盘上消失了才退回"本次运行的结果"。
+        """
+        try:
+            self._rec_runs = past_runs.list_runs(self.cfg)
+        except Exception as exc:
+            log("扫历史推荐结果失败: %s" % exc, "warn")
+            self._rec_runs = []
+        n_rec = 0
+        try:
+            from .history import enabled, load_rows
+            if enabled(self.cfg):
+                n_rec = len(load_rows(self.cfg, limit=self.HISTORY_MAX_ROWS))
+        except Exception:
+            n_rec = 0
+        values = [REC_LIVE] + [r["label"] for r in self._rec_runs] \
+            + ["%s%d 篇)" % (REC_ALL_PREFIX, n_rec)]
+        try:
+            self.cmb_rec_run.configure(values=values)
+        except Exception:
+            return
+        cur = self.var_rec_run.get()
+        if cur not in values:
+            # 当前选的那一份不在了 (报告被删/被移走) —— 退回"本次运行的结果",
+            # 并在日志里说一声, 免得用户以为列表自己变了
+            if cur and cur != REC_LIVE:
+                self._append_log("推荐记录: 「%s」已经找不到了, 退回「%s」"
+                                 % (cur, REC_LIVE), "warn")
+            self.var_rec_run.set(REC_LIVE)
+
+    def _rec_run_for_label(self, label: str) -> Optional[Dict[str, Any]]:
+        for run in self._rec_runs:
+            if run.get("label") == label:
+                return run
+        return None
+
+    def _on_rec_pick(self, _event: Any = None) -> None:
+        """下拉框换了 -> 重铺下面那张列表。"""
+        self._collect_into_cfg()
+        self._apply_rec_pick()
+
+    def _apply_rec_pick(self) -> None:
+        cur = self.var_rec_run.get()
+        if cur.startswith(REC_ALL_PREFIX):
+            self._rec_mode = "all"
+            self.load_history()
+            return
+        run = self._rec_run_for_label(cur)
+        if run is None:
+            self._rec_mode = "live"
+            self._show_live_result()
+            return
+        self._rec_mode = "run"
+        self._show_rec_run(run)
+
+    def _fall_back_to_live(self) -> None:
+        """选中的那一项没东西可铺 (记录关着/是空的) —— 退回"本次运行的结果"。
+
+        下拉框和下面那张列表必须说同一件事: 停在"全部累计记录"上、列表里却还是
+        上一份东西, 用户会以为记录被谁动过。
+        """
+        try:
+            self.var_rec_run.set(REC_LIVE)
+        except Exception:
+            pass
+        self._rec_mode = "live"
+        self._show_live_result()
+
+    def _show_live_result(self) -> None:
+        """铺回"这一轮跑出来的结果"。
+
+        从历史报告切回来时, 这一份得原样还回来 —— 它是刚才那一轮的结果, 重跑
+        一遍要几分钟, 而且结果还不一样。
+        """
+        self._tree_from_history = False
+        self.ranked = list(self._live_ranked)
+        self._fill_tree(self.ranked, set(self._live_top_ids))
+        if self.ranked:
+            self.tree.selection_set("1")
+            self.tree.focus("1")
+            self.tree.see("1")
+            self._show_detail(self.ranked[0])
+            self.set_status("本次运行的结果: %d 篇" % len(self.ranked))
+        else:
+            self._show_detail(None)
+            self.set_status("还没有跑过推荐 —— 点上面的「开始推荐」跑一轮")
+
+    def _show_rec_run(self, run: Dict[str, Any]) -> None:
+        """铺某一次历史推荐的结果 (读的是那一轮留下的报告)。"""
+        from .history import load_rows, rows_as_candidates
+
+        items = list(run.get("items") or [])
+        # 记录库里的解读按 arXiv ID 挂回去: 报告里只有标题和分数, 而详解是**按
+        # 论文**存的 (见 history.py) —— 一篇论文在哪一轮被推荐过, 它的解读就在
+        # 那儿, 不必跟着报告走。
+        rows: Dict[str, Dict[str, Any]] = {}
+        try:
+            for r in load_rows(self.cfg, limit=self.HISTORY_MAX_ROWS):
+                rows[str(r.get("arxiv_id") or "")] = r
+        except Exception as exc:
+            log("读推荐记录失败 (%s), 这一轮的详解可能显示不出来" % exc, "warn")
+        cands = [self._candidate_from_run_item(it, run, rows) for it in items]
+        cands = [c for c in cands if c is not None]
+
+        self.ranked = cands
+        # 铺的是历史报告而不是"这一轮": 那三个细分数报告里没有, 详情面板据此跳过
+        # (见 _show_detail 里 from_history 那一段)。
+        self._tree_from_history = False
+        self._fill_tree(cands, set())
+        if cands:
+            self.tree.selection_set("1")
+            self.tree.focus("1")
+            self.tree.see("1")
+            self._show_detail(cands[0])
+        else:
+            self._show_detail(None)
+        n_an = sum(1 for c in cands if c.analyzed)
+        self._append_log("推荐记录: 铺出 %s 的 %d 篇 (%d 篇有解读) · %s"
+                         % (run.get("generated_at") or run.get("label"),
+                            len(cands), n_an, run.get("path")), "ok")
+        self.set_status("推荐记录 · %s: %d 篇 (读的是当时那份报告)"
+                        % (run.get("generated_at") or "?", len(cands)))
+
+    def _candidate_from_run_item(self, it: Dict[str, Any], run: Dict[str, Any],
+                                 rows: Dict[str, Dict[str, Any]]) -> Any:
+        """报告里的一行 -> Candidate。
+
+        报告里没有摘要、也没有三个细分数, 所以这只是"够铺列表、够开讨论"的一份
+        骨架: 标题/作者/日期/期刊/总分来自报告, 解读和"推荐过几次"来自记录库。
+        """
+        from .history import parse_dt
+        from .models import Candidate
+        from .utils import extract_arxiv_id
+
+        aid = extract_arxiv_id(str(it.get("url") or "")) or ""
+        if not aid:
+            return None
+        c = Candidate(arxiv_id=aid, title=str(it.get("title") or ""))
+        c.authors = [str(it["authors"])] if it.get("authors") else []
+        try:
+            c.score = float(str(it.get("score") or "").strip())
+        except (TypeError, ValueError):
+            c.score = 0.0
+        c.journal_ref = str(it.get("journal") or "")
+        c.categories = [str(x) for x in (it.get("categories") or [])]
+        if c.categories:
+            c.primary_category = c.categories[0]
+        try:
+            c.citations = int(str(it.get("citations") or "").strip())
+        except (TypeError, ValueError):
+            c.citations = None
+        if it.get("date"):
+            c.published = parse_dt(it["date"])
+        c.from_run = True
+        c.record_report = str(run.get("path") or "")
+        row = rows.get(aid)
+        if row:
+            # 解读按论文存, 不跟报告走 —— 所以哪怕是三个月前那一轮铺出来的, 只要
+            # 这篇后来被解读过, 详解就是有的。
+            c.summary = str(row.get("summary") or "")
+            c.ideas = str(row.get("ideas") or "")
+            try:
+                conns = json.loads(row.get("connections") or "[]")
+            except Exception:
+                conns = []
+            c.connections = conns if isinstance(conns, list) else []
+            c.analyzed = bool(row.get("analyzed"))
+            c.seen_before = True
+            c.seen_times = int(row.get("times") or 0)
+            c.last_recommended = str(row.get("last_at") or "")
+        return c
+
     def load_history(self) -> None:
-        """推荐记录: 把记录库里的论文铺到下面那张列表里看。
+        """推荐记录 (下拉框里的「全部累计记录」): 把记录库里的论文铺到列表里看。
 
         **只读, 不删**。删是旁边那个「删除推荐记录」按钮的事 —— 看和删共用一次
         点击的话, 想翻一眼记录的人每次都得先绕过一次删除确认。
@@ -2415,6 +2815,7 @@ class App(tk.Tk):
                 "推荐记录",
                 "推荐记录已经关掉了 (设置页 → \"使用推荐记录\")。\n\n"
                 "关着的时候, 跑完一轮不会往记录里写东西, 这里自然也没得看。")
+            self._fall_back_to_live()
             return
 
         cands = load_records(self.cfg, limit=self.HISTORY_MAX_ROWS)
@@ -2428,7 +2829,7 @@ class App(tk.Tk):
                 "空的。推荐记录在流水线的**最后一步**才写进去 —— 中途停止、关掉"
                 "窗口、或者前面某一步报错, 都不会留下记录。完整跑完一次推荐就有了。"
                 % (describe_history(self.cfg), path))
-            self.set_status("还没有推荐记录")
+            self._fall_back_to_live()
             return
 
         self.ranked = cands
@@ -2513,7 +2914,7 @@ class App(tk.Tk):
             if not item:
                 continue
             # 只填**空的**: 库里已经有值的那几列以库为准 (库是用户自己的记录,
-            # arXiv 只是补缺), 否则每次点「推荐记录」都会把老记录里的期刊刷掉。
+            # arXiv 只是补缺), 否则每次铺一遍记录都会把老记录里的期刊刷掉。
             if not c.authors and item.get("authors"):
                 c.authors = list(item["authors"])
             if c.published is None and item.get("published") is not None:
@@ -2581,12 +2982,22 @@ class App(tk.Tk):
             messagebox.showinfo("推荐记录", "%s\n\n文件: %s\n\n本来就是空的, 不用删。"
                                 % (head, path))
             return
+        # 和 AI 的讨论记录也一起删 (见 history.clear) —— 确认框里得写明, 否则
+        # 用户删完记录才发现"聊了半天的东西也没了"。
+        n_chat = 0
+        try:
+            with RecommendHistory(path) as h:
+                n_chat = h.chat_counts()["messages"]
+        except Exception:
+            n_chat = 0
+        extra = ("\n其中 %d 条是你和 AI 的讨论记录, 会一起删掉。" % n_chat
+                 if n_chat else "")
         if not messagebox.askyesno(
                 "删除推荐记录",
                 "%s\n\n文件: %s\n\n"
                 "要清空推荐记录吗?\n"
                 "(清空只影响这一份记录, 不会删除报告, 也不会动文献索引)"
-                % (head, path)):
+                "%s" % (head, path, extra)):
             return
         try:
             with RecommendHistory(path) as h:
@@ -2594,7 +3005,9 @@ class App(tk.Tk):
         except Exception as exc:
             messagebox.showerror("删除失败", str(exc))
             return
-        self._append_log("推荐记录已清空 (%d 篇)" % n, "warn")
+        self._append_log("推荐记录已清空 (%d 篇%s)"
+                         % (n, (", 含 %d 条讨论记录" % n_chat) if n_chat else ""),
+                         "warn")
         self.set_status("推荐记录已清空: %d 篇" % n)
         # 列表上铺的就是刚被删掉的那些, 留着会让人以为记录还在。但如果现在铺的
         # 是某一轮跑出来的结果, 那和记录是两码事, 不动它。
@@ -2605,6 +3018,369 @@ class App(tk.Tk):
             self.txt_detail.configure(state="normal")
             self.txt_detail.delete("1.0", "end")
             self.txt_detail.configure(state="disabled")
+            # 讨论记录也没了, 对话区跟着清空 (不然屏幕上还留着一场已经不存在的对话)
+            self._chat_msgs = []
+            self._render_chat()
+        # 下拉框里那个"全部累计记录 (N 篇)"的篇数要跟着变。先把选择退回"本次
+        # 运行的结果" —— 记录已经清空, 停在"全部累计记录"上没意义, 而且那一项
+        # 的标签一变, _reload_rec_runs 会以为"选的那份不见了"再报一次警。
+        try:
+            self.var_rec_run.set(REC_LIVE)
+            self._rec_mode = "live"
+        except Exception:
+            pass
+        self._reload_rec_runs()
+
+    # ------------------------------------------------------------------
+    # 和 AI 深入讨论这篇
+    # ------------------------------------------------------------------
+    def _render_chat(self) -> None:
+        """把 ``self._chat_msgs`` 铺进对话区。**只画, 不取数据。**"""
+        txt = getattr(self, "txt_chat", None)
+        if txt is None:
+            return
+        txt.configure(state="normal")
+        txt.delete("1.0", "end")
+        if not self._chat_msgs:
+            c = self._chat_paper
+            if c is None:
+                hint = ("在上面的列表里选一篇论文, 就可以在这里追问它 —— 比如"
+                        "「它的符号问题是怎么绕过的」「这个结论在小格点上还成立吗」。")
+            else:
+                hint = ("还没有聊过这篇。下面输入框里问一句, 比如「这篇的方法我能"
+                        "直接搬到自己的模型上吗」。\n"
+                        "讨论会存在这篇论文的记录里, 下次选中它还在。")
+            txt.insert("end", hint + "\n", "sys")
+        for m in self._chat_msgs:
+            who = str(m.get("role") or "")
+            label = "你" if who == "user" else "AI"
+            txt.insert("end", "%s\n" % label,
+                       "who_user" if who == "user" else "who_ai")
+            txt.insert("end", "%s\n" % str(m.get("content") or "").strip(), "msg")
+        if self._chat_busy_aid:
+            txt.insert("end", "AI 正在思考…\n", "sys")
+        txt.configure(state="disabled")
+        txt.see("end")
+
+    def _load_chat_for(self, c: Any) -> None:
+        """选中的论文换了 -> 把这篇文章的讨论记录读出来铺进对话区。
+
+        库文件不在就直接显示"还没有聊过", **不建库** —— 光选一篇论文看详解不该
+        在用户盘上凭空多出一个 sqlite 文件。
+        """
+        if getattr(self, "txt_chat", None) is None:
+            return          # 对话区还没建出来 (理论上到不了这儿, 兜一手)
+        self._chat_paper = c
+        aid = str(getattr(c, "arxiv_id", "") or "") if c is not None else ""
+        if aid:
+            title = (getattr(c, "title", "") or "").replace("$", "")
+            self.var_chat_paper.set("正在讨论: %s" % (truncate(title, 56, "…")
+                                                   if title else aid))
+        else:
+            self.var_chat_paper.set("还没有选中论文")
+        if self._chat_busy_aid and self._chat_busy_aid == aid:
+            # 这篇正在等 AI 回复: 界面上的对话不能重读一遍 —— 那条"正在思考…"
+            # 和刚发出去的问题还没落进库, 重读会把它们抹掉。
+            return
+        self._chat_msgs = []
+        if aid:
+            try:
+                from .history import load_chat
+                self._chat_msgs = load_chat(self.cfg, aid)
+            except Exception as exc:
+                log("读讨论记录失败: %s" % exc, "warn")
+        self._render_chat()
+
+    def _chat_ai(self, cfg: Dict[str, Any]) -> Any:
+        """建一个 AI 客户端。没配 key / 配错就直接抛 (由调用方报给用户)。"""
+        from .ai import build_client
+        return build_client(cfg, None)
+
+    def _chat_context(self, cfg: Dict[str, Any], c: Any) -> Any:
+        """这篇论文的提示词前缀 (带缓存)。返回 ``(前缀, 标签)``。
+
+        拼一次要读文献库、算 TF-IDF, 每问一句都重算太亏。缓存按 arXiv ID 存,
+        "用对话更新详解"之后清掉 —— 那份前缀里含**旧**的详解。
+        """
+        aid = str(getattr(c, "arxiv_id", "") or "")
+        hit = self._chat_ctx.get(aid)
+        if hit is not None:
+            return hit
+        from . import chat as chat_mod
+        profile = None
+        res = getattr(self, "result", None)
+        if res is not None and getattr(res, "profile", None) is not None:
+            # 这一轮跑出来的画像最贴题 (推荐就是按它做的), 有就用它
+            profile = res.profile
+        ctx = chat_mod.build_context(cfg, c, profile=profile,
+                                     papers=self._chat_papers_cache(cfg))
+        self._chat_ctx[aid] = ctx
+        return ctx
+
+    def _chat_papers_cache(self, cfg: Dict[str, Any]) -> Any:
+        """文献库列表 (讨论用)。缓存一份 —— 它是拼上下文里最贵的那一步。"""
+        if getattr(self, "_chat_papers", None) is None:
+            try:
+                from .library import load_library
+                self._chat_papers = load_library(cfg)[0]
+            except Exception as exc:
+                log("讨论: 读文献库失败 (%s)" % exc, "warn")
+                self._chat_papers = []
+        return self._chat_papers
+
+    def send_chat(self) -> None:
+        """把输入框里那句话发给 AI。"""
+        c = self._chat_paper
+        if c is None:
+            messagebox.showinfo("先选一篇", "在上面的列表里点一篇论文, 再和 AI 讨论。")
+            return
+        text = (self.var_chat_in.get() or "").strip()
+        if not text:
+            return
+        aid = str(getattr(c, "arxiv_id", "") or "")
+        if not aid:
+            messagebox.showinfo("没有 arXiv ID",
+                                "这篇没有 arXiv ID, 讨论没法按论文存起来。")
+            return
+        if self._chat_busy_aid:
+            messagebox.showinfo("正在等回复", "上一个问题还没答完, 等它答完再问。")
+            return
+        self._collect_into_cfg()
+        cfg = self.cfg
+        if self.dirty:
+            self.save_config()
+
+        # 用户这句**先落库**: 它是用户敲进去的东西, 不该因为 AI 那边失败而丢掉。
+        from .history import append_chat
+        if not append_chat(cfg, aid, "user", text):
+            messagebox.showerror("存不下来",
+                                 "这句没能写进推荐记录 (%s)。\n\n"
+                                 "对话是按论文存进推荐记录库的, 存不进去就不发出去 ——"
+                                 " 免得聊完才发现全丢了。"
+                                 % self._history_hint())
+            return
+        self.var_chat_in.set("")
+        self._chat_msgs.append({"role": "user", "content": text})
+        self._chat_busy_aid = aid
+        self._render_chat()
+        self.btn_chat_send.configure(state="disabled")
+
+        history_msgs = list(self._chat_msgs[:-1])   # 不含刚问的这一句
+        title = (getattr(c, "title", "") or "").replace("$", "")
+
+        def _work() -> None:
+            try:
+                ai = self._chat_ai(cfg)
+                from . import chat as chat_mod
+                cache = None
+                try:
+                    cache = build_caches(cfg)["http"]
+                except Exception:
+                    pass
+                # 手上没有摘要 (从记录/报告里翻出来的老论文就是这样) 就先取一份
+                if chat_mod.ensure_abstract(cfg, c, cache=cache):
+                    self.queue.put(("chat_meta", aid))
+                prefix, _labels = self._chat_context(cfg, c)
+                answer = chat_mod.reply(ai, prefix, history_msgs, text)
+                if not answer:
+                    self.queue.put(("chat_err", aid, "AI 返回了空内容"))
+                    return
+                append_chat(cfg, aid, "assistant", answer)
+                self.queue.put(("chat_ok", aid, answer))
+            except Exception as exc:
+                self.queue.put(("chat_err", aid, "%s" % exc))
+
+        self._chat_thread = threading.Thread(target=_work, daemon=True)
+        self._chat_thread.start()
+
+    def _history_hint(self) -> str:
+        try:
+            from .history import describe_history
+            return describe_history(self.cfg)
+        except Exception:
+            return "推荐记录"
+
+    def _on_chat_reply(self, aid: str, text: str) -> None:
+        self._chat_busy_aid = ""
+        self.btn_chat_send.configure(state="normal")
+        if str(getattr(self._chat_paper, "arxiv_id", "") or "") == aid:
+            self._chat_msgs.append({"role": "assistant", "content": text})
+            self._render_chat()
+        else:
+            # 等回复的时候用户换到别的论文去了。回复照常存进库 (上面已经存了),
+            # 只是不往现在这一屏上贴 —— 贴上去就是张冠李戴。
+            self._append_log("AI 对 %s 的回复已存进那篇论文的讨论记录" % aid, "info")
+            self._render_chat()
+        self._append_log("讨论: %s 已回复 (%d 字)" % (aid, len(text)), "ok")
+        self.set_status("讨论: 已回复 (%d 字)" % len(text))
+
+    def _on_chat_fail(self, aid: str, msg: str) -> None:
+        self._chat_busy_aid = ""
+        self.btn_chat_send.configure(state="normal")
+        self._append_log("讨论失败: %s" % msg, "err")
+        self.set_status("讨论失败: %s" % msg)
+        if str(getattr(self._chat_paper, "arxiv_id", "") or "") == aid:
+            # 不弹对话框: 对话区里写一行就够了, 而且用户刚问的那句还看得见 ——
+            # 弹窗关掉之后那句话就不知道跑哪儿去了。
+            self._chat_msgs.append(
+                {"role": "assistant",
+                 "content": "(这次没答上来: %s)\n可以再点一次「发送」重试。" % msg})
+            self._render_chat()
+
+    def _on_chat_meta(self, aid: str) -> None:
+        """取回了这篇的摘要 —— 详解面板里那一格得跟着显示出来。"""
+        c = self._chat_paper
+        if str(getattr(c, "arxiv_id", "") or "") != aid:
+            return
+        self._show_detail(c)
+        self._append_log("讨论: 已从 arXiv 取回 %s 的摘要" % aid, "info")
+
+    def clear_chat(self) -> None:
+        """清空**这一段**对话 (推荐记录里的标题、分数、解读一概不动)。"""
+        c = self._chat_paper
+        if c is None or not self._chat_msgs:
+            messagebox.showinfo("没有对话", "这篇还没有聊过。")
+            return
+        if not messagebox.askyesno(
+                "清空这段对话",
+                "删掉和 AI 关于《%s》的 %d 条讨论?\n\n"
+                "(只删这段对话; 推荐记录里的标题、分数、详解都不动)"
+                % (truncate((c.title or "").replace("$", ""), 40, "…"),
+                   len(self._chat_msgs))):
+            return
+        self._collect_into_cfg()
+        from .history import clear_chat as _clear
+        n = _clear(self.cfg, str(c.arxiv_id or ""))
+        self._chat_msgs = []
+        self._render_chat()
+        self._append_log("讨论: 清空了 %s 的 %d 条记录" % (c.arxiv_id, n), "warn")
+        self.set_status("讨论已清空: %d 条" % n)
+
+    def update_detail_from_chat(self) -> None:
+        """「用对话更新详解」: 让 AI 按这场讨论重写这篇的解读, 并写回记录。
+
+        **单独一个按钮**是刻意的: 聊十句攒下的理解, 什么时候落进详解由用户决定。
+        每聊一句就重写一遍的话, 详解会在脚下不断变形, 而且每问一句都要多花一次
+        AI 调用。
+        """
+        c = self._chat_paper
+        if c is None:
+            messagebox.showinfo("先选一篇", "在上面的列表里点一篇论文, 再点这个按钮。")
+            return
+        if self._chat_busy_aid:
+            messagebox.showinfo("正在等回复", "上一个问题还没答完, 等它答完再更新详解。")
+            return
+        if not [m for m in self._chat_msgs if str(m.get("role")) == "user"]:
+            messagebox.showinfo(
+                "还没有讨论",
+                "这篇还没有和 AI 聊过 —— 详解要按讨论来重写, 先问几句再点这里。\n\n"
+                "(只是想重新解读一遍的话, 跑一轮推荐即可, 那会按研究画像重写。)")
+            return
+        aid = str(getattr(c, "arxiv_id", "") or "")
+        if not aid:
+            return
+        self._collect_into_cfg()
+        cfg = self.cfg
+        if self.dirty:
+            self.save_config()
+        self.btn_chat_detail.configure(state="disabled")
+        self.btn_chat_detail.configure(text="正在更新…")
+        self._chat_busy_aid = aid
+        self._render_chat()
+        msgs = list(self._chat_msgs)
+        title = (getattr(c, "title", "") or "").replace("$", "")
+
+        def _work() -> None:
+            try:
+                ai = self._chat_ai(cfg)
+                from . import chat as chat_mod
+                cache = None
+                try:
+                    cache = build_caches(cfg)["http"]
+                except Exception:
+                    pass
+                chat_mod.ensure_abstract(cfg, c, cache=cache)
+                prefix, labels = self._chat_context(cfg, c)
+                got = chat_mod.rewrite_analysis(ai, prefix, msgs, labels)
+                if not (got.get("summary") or got.get("ideas")):
+                    self.queue.put(("chat_detail_err", aid, "AI 没能给出新的详解"))
+                    return
+                from .history import profile_fingerprint, save_analysis
+                # 画像指纹照旧写: 下次跑推荐时, 这份解读就能按"画像没变"被复用,
+                # 不必再花一次 token (见 history.reuse_analysis)。
+                fp = ""
+                try:
+                    res = getattr(self, "result", None)
+                    if res is not None and getattr(res, "profile", None):
+                        fp = profile_fingerprint(res.profile)
+                except Exception:
+                    fp = ""
+                _apply_chat_analysis(c, got)
+                save_analysis(cfg, c, fp)
+                self.queue.put(("chat_detail", aid, got))
+            except Exception as exc:
+                self.queue.put(("chat_detail_err", aid, "%s" % exc))
+
+        self._chat_thread = threading.Thread(target=_work, daemon=True)
+        self._chat_thread.start()
+
+    def _on_chat_detail(self, aid: str, got: Dict[str, Any]) -> None:
+        """详解更新完了: 内存里的候选对象、列表那一行的标记、详解面板一起刷新。"""
+        self._chat_busy_aid = ""
+        self.btn_chat_detail.configure(state="normal")
+        self.btn_chat_detail.configure(text="用对话更新详解")
+        c = self._chat_paper
+        if c is None or str(getattr(c, "arxiv_id", "") or "") != aid:
+            self._append_log("讨论: %s 的详解已按讨论更新并写回记录" % aid, "ok")
+            self._render_chat()
+            return
+        # 上下文里含旧详解, 必须作废 —— 下一次提问要基于**新**的详解
+        self._chat_ctx.pop(aid, None)
+        self._show_detail(c)
+        self._refresh_tree_row(c)
+        self._render_chat()
+        self._append_log("讨论: 《%s》的详解已按讨论更新, 并写回推荐记录"
+                         % truncate((c.title or "").replace("$", ""), 40, "…"),
+                         "ok")
+        self.set_status("详解已按讨论更新 (写回推荐记录)")
+
+    def _on_chat_detail_fail(self, aid: str, msg: str) -> None:
+        """更新详解失败: 把按钮**放回可点的样子**, 别的照旧。
+
+        单独一条路径 (不复用 _on_chat_fail) 是因为这里不能往对话区里塞一句
+        "(这次没答上来)" —— 那句话是 AI 答不上追问, 而这次是详解没重写成功,
+        对话本身好好的, 一句没丢。
+        """
+        self._chat_busy_aid = ""
+        self.btn_chat_detail.configure(state="normal")
+        self.btn_chat_detail.configure(text="用对话更新详解")
+        # 重画一下: 刚才置了 busy, 对话区末尾挂着一行"AI 正在思考…", 得撤掉
+        self._render_chat()
+        self._append_log("更新详解失败: %s (对话没动, 可以再点一次)" % msg, "err")
+        self.set_status("更新详解失败: %s" % msg)
+
+    def _refresh_tree_row(self, c: Any) -> None:
+        """列表里那一行的"已解读"标记要跟着变 —— 刚更新完详解, 标记得亮起来。"""
+        # 按**身份**找, 不用 list.index: Candidate 是 dataclass, __eq__ 比的是
+        # 所有字段 —— 两篇不同的论文碰巧字段全同就会指错行 (而且逐个比字段很慢)。
+        i = 0
+        for j, cand in enumerate(self.ranked):
+            if cand is c:
+                i = j + 1
+                break
+        if not i:
+            return
+        iid = str(i)
+        if not self.tree.exists(iid):
+            return
+        vals = list(self.tree.item(iid, "values"))
+        if len(vals) < 7:
+            return
+        flags = [f for f in str(vals[6] or "").split() if f]
+        if "已解读" not in flags and "复用解读" not in flags:
+            flags.append("已解读")
+        vals[6] = " ".join(flags)
+        self.tree.item(iid, values=vals)
 
     def clear_index(self) -> None:
         if not messagebox.askyesno(
@@ -2697,7 +3473,26 @@ class App(tk.Tk):
             self.set_status("完成 · " + res.summary())
 
         self._tree_from_history = False
+        # 这一轮的结果留一份: 「推荐记录」下拉框切回"本次运行的结果"时要原样还
+        # 回来 —— 重跑一遍要几分钟, 而且结果还不一样。
+        self._live_ranked = list(res.ranked or [])
+        self._live_top_ids = {c.arxiv_id for c in (res.top or [])}
         self._fill_tree(res.ranked, {c.arxiv_id for c in (res.top or [])})
+
+        # 刚跑完, 下拉框回到"本次运行的结果", 并把这一轮新写下的报告扫进来 (它
+        # 此刻才第一次出现在选项里)。用户想看上一轮, 从这里挑就是了。
+        try:
+            self.var_rec_run.set(REC_LIVE)
+        except Exception:
+            pass
+        self._rec_mode = "live"
+        self._reload_rec_runs()
+
+        # 换了一轮, 拼上下文用的那两个缓存作废: 里面存的是上一轮那份画像和文献库,
+        # 留着会让新一篇的讨论接着旧上下文走。**不动**对话区本身 —— 它跟着下面
+        # 详解面板里那一篇走, 而详解面板此刻还停在上一篇上 (见 _show_detail)。
+        self._chat_ctx.clear()
+        self._chat_papers = None
 
         if res.report_paths:
             self.btn_report.configure(state="normal")
@@ -2813,6 +3608,12 @@ class App(tk.Tk):
         t = self.txt_detail
         t.configure(state="normal")
         t.delete("1.0", "end")
+        if c is None:
+            # 列表空了 (清空记录 / 还没跑过推荐) —— 详解和对话区一起空着, 别把
+            # 上一篇的内容留在屏幕上
+            t.configure(state="disabled")
+            self._load_chat_for(None)
+            return
 
         def put(text: str, tag: str = "") -> None:
             # 空 tag 串不能直接传给 insert —— 那会被当成"一个叫空字符串的 tag",
@@ -2838,13 +3639,18 @@ class App(tk.Tk):
         put(" · ".join(meta), "meta")
         put("arXiv: %s" % c.arxiv_id, "meta")
         t.insert("end", c.abs_url + "\n", "link")
-        if c.from_history:
-            # 这条是从记录库读回来的, 那三个分数**根本没存进库** (库里存的是
-            # "推荐过没有"和当时的解读)。照常列出来就是三个 0.00, 读起来像
-            # "这篇论文三项全 0 分" —— 是在报假数据。列表里那一列分数是真的
-            # (存了 best_score), 所以只有这一段要跳过。
-            put("记录: 推荐过 %d 次 · 最近一次 %s"
-                % (c.seen_times, c.last_recommended or "—"), "meta")
+        if c.from_history or c.from_run:
+            # 这两类都是从别处读回来的, 那三个分数**根本没存下来** (记录库里存
+            # 的是"推荐过没有"和当时的解读, 报告里只有总分)。照常列出来就是三个
+            # 0.00, 读起来像"这篇论文三项全 0 分" —— 是在报假数据。
+            if c.from_run:
+                # 报告里有那一轮的总分, 这个数是真的, 照实写出来
+                put("总分 %.3f (那一轮报告里的分数) · 来自 %s"
+                    % (c.score, os.path.basename(c.record_report)
+                       if c.record_report else "历史报告"), "meta")
+            if c.seen_times:
+                put("记录: 推荐过 %d 次 · 最近一次 %s"
+                    % (c.seen_times, c.last_recommended or "—"), "meta")
             if c.record_report:
                 put("当时写进: %s" % c.record_report, "meta")
         else:
@@ -2860,7 +3666,15 @@ class App(tk.Tk):
                 "meta")
 
         put("摘要", "head")
-        put(c.abstract or "(无)")
+        if c.abstract:
+            put(c.abstract)
+        elif c.from_history or c.from_run:
+            # 从记录/报告里读回来的论文手上没有摘要 (摘要没进记录库)。说清楚它会
+            # 自己取回来 —— 否则"摘要 (无)"看着像这篇论文没有摘要。
+            put("(记录里没存摘要。和 AI 讨论时程序会自动去 arXiv 取一份, "
+                "取回来就显示在这里)", "meta")
+        else:
+            put("(无)")
         if c.summary:
             put("内容讲解", "head")
             put(c.summary)
@@ -2878,14 +3692,18 @@ class App(tk.Tk):
         if not c.analyzed:
             put("")
             put("(这篇没有做 AI 深度解读 —— 它不在推荐的前 N 篇里, "
-                "或者本次运行关闭了 AI)" if not c.from_history else
+                "或者本次运行关闭了 AI)" if not (c.from_history or c.from_run) else
                 "(这篇当时没做 AI 深度解读 —— 它不在那一轮推荐的前 N 篇里, "
-                "或者那一轮关闭了 AI; 记录里只留了标题和分数)", "meta")
+                "或者那一轮关闭了 AI; 记录里只留了标题和分数。想深入看的话, "
+                "可以在下面和 AI 聊几句, 再点「用对话更新详解」)", "meta")
         t.configure(state="disabled")
         t.yview_moveto(0.0)
         # 内容换了, 高度得重算 (而且是重算**几拍** —— 估一次、按 yview 补、再让
         # 整页跟上)。fresh=True: 这是新内容, 允许变矮。
         self._settle_detail(None, 0, True)
+        # 详解和讨论是同一篇论文的两块: 换了一篇, 对话区也跟着换。放在这里而不是
+        # 每个调用点, 是因为"当前选中的是哪一篇"这件事只有这里说了算。
+        self._load_chat_for(c)
 
     def open_report(self) -> None:
         """打开最近一份报告。

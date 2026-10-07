@@ -1,7 +1,9 @@
 # --- 打包产物 ---
-# dist/ 是 build_exe.py 的输出 (283MB 的 exe 放这里)。
+# dist/ 是 build_exe.py 的输出 (exe 放这里: --venv 出来约 74MB, 不带是 283MB)。
 # exe 通过 GitHub Releases 发布, 不进仓库。
 dist/
+dist_venv/
+release/
 build/
 *.spec
 
@@ -20,6 +22,8 @@ cache/
 output/
 *.sqlite
 *.sqlite-journal
+# `--check` 自检写出来的报告, 落在 exe 旁边 (源码方式跑就落在仓库根目录)
+check_report.txt
 
 # 本地配置: 含 API key 和个人 PDF 路径。模板见 config.example.json,
 # 首次运行 ui.py 也会自动生成一份。

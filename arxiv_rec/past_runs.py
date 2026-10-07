@@ -174,8 +174,8 @@ def parse_report(text: str) -> Dict[str, Any]:
             "date": "" if date == "—" else date,
             "journal": "" if journal == "—" else journal,
             # 分类解析成列表 (报告里写的是 "cond-mat.str-el, hep-th" 这种一行)。
-            # 「推荐记录」按钮要把记录铺成列表, 而老记录里没存分类 —— 有这一项,
-            # 那些行才能从当时的报告里把主分类补出来, 详解里不会缺一格。
+            # 铺记录时要用它, 而老记录里没存分类 —— 有这一项, 那些行才能从当时的
+            # 报告里把主分类补出来, 详解里不会缺一格。
             "categories": _split_cats(det.get("分类") or ""),
             "score": row.get("score") or "",
             "citations": row.get("citations") or "",

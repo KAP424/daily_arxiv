@@ -87,7 +87,7 @@ json.dump(raw, io.open(cfg_dst, "w", encoding="utf-8"), ensure_ascii=False, inde
 
 import tkinter as tk
 from tkinter import ttk
-from arxiv_rec.ui import App
+from arxiv_rec.ui import App, REC_LIVE, REC_ALL_PREFIX
 from arxiv_rec.utils import setup_console
 
 setup_console()
@@ -411,12 +411,13 @@ check("_fill_tree 传空列表能把表清干净",
 
 print()
 print("=" * 70)
-print("A4) 推荐记录: 一个按钮铺列表 (只读), 另一个按钮才删除")
+print("A4) 推荐记录: 铺列表 (只读), 删除是另一个按钮")
 print("=" * 70)
 
-# 这两件事刻意分成两个按钮: 「推荐记录」= 把库里的记录铺到下面那张表里看;
-# 「删除推荐记录」= 清空。以前它们挤在同一个按钮上 (看完弹窗, 关掉前问一句要
-# 不要清空) —— 想翻一眼记录的人每次都得绕过一次删除确认。
+# 这两件事刻意分开: 「推荐记录」下拉框 (这里走的是"全部累计记录"那条路) = 把库里的
+# 记录铺到下面那张表里看; 「删除推荐记录」= 清空。以前它们挤在同一个按钮上 (看完
+# 弹窗, 关掉前问一句要不要清空) —— 想翻一眼记录的人每次都得绕过一次删除确认。
+# 下拉框本身 (选哪一轮) 由 A6 那一组管。
 for _sib in ("开始推荐", "打开报告"):
     check("推荐页按钮行里的 %s 能被收集到 (于是下面两条有约束力)" % _sib,
           _sib in rec_labels, rec_labels)
@@ -622,8 +623,13 @@ try:
     check("那句解释点出了'最后一步才写记录'", "最后一步" in _dlg["info_text"],
           _dlg["info_text"][:200])
     check("空库时不铺列表", len(app.tree.get_children()) == 0)
-    check("空库时状态栏说'还没有推荐记录'",
-          app.var_status.get() == "还没有推荐记录", app.var_status.get())
+    # 空库时下拉框会退回「本次运行的结果」(不然它停在一个已经没东西可铺的选项
+    # 上, 而下面那张表是别的来源)。状态栏说的是**屏幕上这张表**的状态, 所以它
+    # 讲的是"这一轮还没跑过", 而不是"推荐记录是空的" —— 后者那句在弹窗里。
+    check("空库时退回'本次运行的结果'",
+          app.var_rec_run.get() == REC_LIVE, app.var_rec_run.get())
+    check("空库时状态栏讲的是这一轮的结果 (屏幕上铺的就是它)",
+          "还没有跑过推荐" in app.var_status.get(), app.var_status.get())
 
     # 空库时点删除: 不该再弹一次"确定要清空吗" (本来就空, 问了也白问)
     _dlg["info"] = 0
@@ -679,7 +685,7 @@ finally:
 
 print()
 print("=" * 70)
-print("A5) 详解整段铺开 (自己不滚), 日志不横滚, 滚轮归整页")
+print("A5) 详解整段铺开 (自己不滚), 日志不横滚, 滚轮归整页, Ctrl+滚轮归最外侧")
 print("=" * 70)
 
 # 用户的原话: "运行日志那不需要左右滚轮" + "详解那不需要单独设置滚轮, 直接显示
@@ -847,7 +853,130 @@ if _cv5 is not None:
     check("整页滚轮真的能往下滚 (滚到底就能看到详解末尾)",
           float(_cv5.yview()[0]) > 0.0, _cv5.yview())
 
-# --- 4. 老 config.json 里残留的 ui 段: 点一次"保存设置"就该自己消失 ---
+# --- 4. Ctrl + 滚轮: 滚的是整页最外侧那个滚动条 ---
+# 上面刚验过"指针在结果表上滚的是表格自己"。要滚整页就得按住 Ctrl, 而这件事
+# 只能靠**按控件类**挂 <Control-MouseWheel> 来做 (见 ui.py 的 _bind_ctrl_wheel):
+# 实测 Tk 8.6.9 下按住 Ctrl 时 <MouseWheel> 照样匹配, 挂到 "all" 上的话表格会
+# 跟着一起滚 —— 两个滚动条一起动, 正是这个功能要消掉的东西。
+check("Text 类挂上了 <Control-MouseWheel>",
+      bool(app.bind_class("Text", "<Control-MouseWheel>")),
+      repr(app.bind_class("Text", "<Control-MouseWheel>")))
+check("Treeview 类挂上了 <Control-MouseWheel>",
+      bool(app.bind_class("Treeview", "<Control-MouseWheel>")),
+      repr(app.bind_class("Treeview", "<Control-MouseWheel>")))
+
+# 上面那两行的前提是"页面里自带滚动条的控件只有这两种"。将来谁往页面里塞一个
+# Listbox 之类, 这一条会先挂 —— 而不是让 Ctrl+滚轮在它上面悄悄失灵。
+_self_scroll6 = []
+for _w6 in all_widgets(app):
+    try:
+        if str(_w6.cget("yscrollcommand")):
+            _self_scroll6.append(_w6)
+    except Exception:
+        pass
+
+
+def _ok_scroller(w):
+    """自带滚动条的控件是不是"按类挂上就行"的那几种。
+
+    整页容器 (canvas) 也在名单里: 它自己的滚动条**就是**最外侧那条, 不用抢。
+    """
+    return (isinstance(w, (tk.Text, ttk.Treeview))
+            or getattr(w, "page_canvas", None) is w)
+
+
+check("自带竖向滚动条的控件只有 Text / Treeview (整页容器除外)",
+      all(_ok_scroller(w) for w in _self_scroll6),
+      [(str(w), type(w).__name__) for w in _self_scroll6
+       if not _ok_scroller(w)])
+check("确实找到了自带滚动条的控件 (上面那条不是空话)",
+      len(_self_scroll6) >= 5, len(_self_scroll6))
+
+check("从结果表往上找到的是整页 canvas (不是它自己)",
+      app._outermost_canvas(app.tree) is _cv5, app._outermost_canvas(app.tree))
+check("从日志框往上找到的也是整页 canvas",
+      app._outermost_canvas(app.txt_run_log) is _cv5,
+      app._outermost_canvas(app.txt_run_log))
+check("canvas 自己也认得自己 (指针落在它身上时也找得到)",
+      app._outermost_canvas(_cv5) is _cv5, app._outermost_canvas(_cv5))
+# 「文献列表」页没有整页容器: 那一页最外侧的滚动条**就是**表格自己的, 所以这里
+# 必须返回 None (也就是不 break), 让表格照旧自己滚。
+check("「文献列表」页找不到整页容器 (Ctrl+滚轮不抢它的滚轮)",
+      app._outermost_canvas(app.tree_lib) is None,
+      app._outermost_canvas(app.tree_lib))
+
+# 结果表和日志框都得**真有得滚**, 否则"它自己没动"那句话是空的
+for _i6 in range(60):
+    app.tree.insert("", "end", values=(_i6 + 1, "占位论文 %d" % _i6, "作者",
+                                       "2026-09-01", "期刊", "0.500", ""))
+app.txt_run_log.configure(state="normal")
+app.txt_run_log.insert("end", "\n".join("滚轮测试行 %d" % _i6
+                                        for _i6 in range(40)))
+app.txt_run_log.configure(state="disabled")
+for _ in range(3):
+    app.update()
+check("结果表自己滚得动 (不是空表)", float(app.tree.yview()[1]) < 0.999,
+      app.tree.yview())
+check("日志框自己滚得动 (不是空框)", float(app.txt_run_log.yview()[1]) < 0.999,
+      app.txt_run_log.yview())
+
+if _cv5 is not None:
+    _cv5.yview_moveto(0.0)
+    app.tree.yview_moveto(0.0)
+    app.txt_run_log.yview_moveto(0.0)
+    app.update()
+    _tree6 = app.tree.yview()[0]
+    app.tree.event_generate("<Control-MouseWheel>", delta=-120)
+    app.update()
+    check("Ctrl+滚轮 停在结果表上 -> 滚的是整页", float(_cv5.yview()[0]) > 0.0,
+          _cv5.yview())
+    check("Ctrl+滚轮 停在结果表上 -> 表格自己纹丝不动",
+          app.tree.yview()[0] == _tree6, (app.tree.yview(), _tree6))
+
+    _cv5.yview_moveto(0.0)
+    app.txt_run_log.yview_moveto(0.0)
+    app.update()
+    _log6 = app.txt_run_log.yview()[0]
+    app.txt_run_log.event_generate("<Control-MouseWheel>", delta=-120)
+    app.update()
+    check("Ctrl+滚轮 停在日志框上 -> 滚的是整页", float(_cv5.yview()[0]) > 0.0,
+          _cv5.yview())
+    check("Ctrl+滚轮 停在日志框上 -> 日志框自己纹丝不动",
+          app.txt_run_log.yview()[0] == _log6,
+          (app.txt_run_log.yview(), _log6))
+
+    # 往上滚也认 (方向来自 delta 的正负, 和普通滚轮那套一致)
+    _cv5.yview_moveto(0.5)
+    app.update()
+    _mid6 = float(_cv5.yview()[0])
+    app.tree.event_generate("<Control-MouseWheel>", delta=120)
+    app.update()
+    check("Ctrl+往上滚 -> 整页往回滚", float(_cv5.yview()[0]) < _mid6,
+          (_mid6, _cv5.yview()))
+
+# 不带 Ctrl 时老规矩一个字不改: 指针在表格上, 滚的就是表格自己
+app.tree.yview_moveto(0.0)
+if _cv5 is not None:
+    _cv5.yview_moveto(0.0)
+app.tree.event_generate("<Enter>")      # 指针进表格 -> 整页滚轮让给表格
+app.update()
+app.tree.event_generate("<MouseWheel>", delta=-120)
+app.update()
+check("不带 Ctrl 滚结果表 -> 表格自己滚 (老行为没被改坏)",
+      float(app.tree.yview()[0]) > 0.0, app.tree.yview())
+check("不带 Ctrl 滚结果表 -> 整页没动",
+      _cv5 is None or float(_cv5.yview()[0]) == 0.0,
+      _cv5.yview() if _cv5 is not None else None)
+app.tree.event_generate("<Leave>")
+app.update()
+
+# 收尾: 把为这一节塞进去的占位行清掉, 别带给后面几节
+for _item6 in app.tree.get_children()[1:]:
+    app.tree.delete(_item6)
+for _ in range(2):
+    app.update()
+
+# --- 5. 老 config.json 里残留的 ui 段: 点一次"保存设置"就该自己消失 ---
 # 上一版把"详解被拖到多高"写在 ui.detail_height 里。现在没有这一项了, 但那一段
 # 还躺在用户的 config.json 里 —— 保存一次之后不能再留着 (否则年年留一段谁都
 # 不认识、谁都不敢删的配置)。
@@ -871,6 +1000,480 @@ app.ranked = []
 app._tree_from_history = False
 app._fill_tree([], {})
 for _ in range(2):
+    app.update()
+
+print()
+print("=" * 70)
+print("A6) 「推荐记录」下拉框: 挑看哪一轮 · 和 AI 深入讨论这一篇")
+print("=" * 70)
+
+# 用户的原话: "比如我总共开始推荐了3次, 推荐记录那里应该可以选择用哪次的推荐记录,
+# 选择后下面的列表就显示那次的推荐结果" + "在这个界面再添加一个 ai 进一步对话的
+# 窗口…交流的结果也存在这个文献的记忆里…更新文献的详解需要单独加一个按钮"。
+#
+# 这一节把两件事都走一遍。造两份报告当"跑过的两轮" —— 不依赖真跑推荐, 也不依赖
+# arXiv 通不通; 真跑那两轮在 D/E 节。
+from arxiv_rec.history import RecommendHistory as _RH6
+from arxiv_rec.history import load_chat as _lc6
+from arxiv_rec.history import load_rows as _lrows6
+from arxiv_rec.models import Candidate as _C6
+from arxiv_rec.models import LibraryPaper
+
+# A4 那一节的 finally 已经把弹窗还原成真的了, 这里再拦一次 (后面要问"到底弹了
+# 没有"), 结束时照样还原。
+_real_ask6 = _ui.messagebox.askyesno
+_real_info6 = _ui.messagebox.showinfo
+_real_err6 = _ui.messagebox.showerror
+_ui.messagebox.askyesno = _fake_ask
+_ui.messagebox.showinfo = _fake_info
+_ui.messagebox.showerror = _fake_err
+_out_dir = raw["output"]["dir"]
+os.makedirs(_out_dir, exist_ok=True)
+
+_RUN_HEAD = u"""# arXiv 相关文献推荐报告
+
+> 由你的本地文献库自动分析生成 · 生成时间 %s
+
+## 三、推荐总览
+
+| # | 论文 | 提交日期 | 相关性 | 时效性 | 重要性 | 总分 | 引用 | 标记 |
+| ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | --- |
+"""
+
+
+def _mk_run(path, stamp, rows):
+    """按报告的真实版式造一份: rows = [(标题, id, 日期, 总分, 作者, 分类)]。"""
+    body = [_RUN_HEAD % stamp]
+    for i, (title, aid, date, score, author, cat) in enumerate(rows, 1):
+        body.append("| %d | [%s](https://arxiv.org/abs/%s) | %s | 0.90 | 0.90 | "
+                    "0.30 | **%s** | 7 |  |\n" % (i, title, aid, date, score))
+    body.append("\n")
+    for i, (title, aid, date, score, author, cat) in enumerate(rows, 1):
+        body.append("\n### %d. %s\n\n**arXiv**: [%s](https://arxiv.org/abs/%s)"
+                    " · **PDF**: [下载](https://arxiv.org/pdf/%s)\n\n"
+                    "**作者**: %s · **提交**: %s\n\n**分类**: %s\n"
+                    % (i, title, aid, aid, aid, author, date, cat))
+    with io.open(path, "w", encoding="utf-8") as _fh:
+        _fh.write("".join(body))
+
+
+_RUN_A = os.path.join(_out_dir, "arxiv_recommend_20260928_090000.md")
+_RUN_B = os.path.join(_out_dir, "arxiv_recommend_20260929_105537_second.md")
+_mk_run(_RUN_A, "2026-09-28 09:00:00",
+        [("第一轮的第一篇", "2401.50001", "2026-09-20", "0.801",
+          "Wei Wang, Li Chen", "cond-mat.str-el"),
+         ("第一轮的第二篇", "2401.50002", "2026-09-19", "0.602",
+          "Bo Zhang", "cond-mat.str-el")])
+_mk_run(_RUN_B, "2026-09-29 10:55:37",
+        [("第二轮的那一篇", "2401.50003", "2026-09-25", "0.700",
+          "Qiang Liu", "cond-mat.str-el")])
+
+# 记录库里给第一轮那两篇各留一条记录: 一篇有解读, 一篇没有。报告里**没有**解读,
+# 它得从记录库里按 arXiv ID 挂回来 —— 这一条要验的就是那个挂接。
+with _RH6(_hdb) as _h6:
+    _c6a = _C6(arxiv_id="2401.50001", title="第一轮的第一篇")
+    _c6a.summary = "记录库里存着的讲解。"
+    _c6a.ideas = "记录库里存着的方向。"
+    _c6a.analyzed = True
+    _h6.record([_c6a, _C6(arxiv_id="2401.50002", title="第一轮的第二篇")],
+               profile_fp="fp6")
+
+_dlg["info"] = 0
+_dlg["info_text"] = ""
+app.var_use_history.set(True)
+app.refresh_rec_runs()
+app.update()
+
+_vals6 = list(app.cmb_rec_run.cget("values"))
+check("下拉框第一项是'本次运行的结果'", _vals6[0] == REC_LIVE, _vals6)
+check("下拉框列出了两轮历史推荐 (新的在前)",
+      any("2026-09-29 10:55:37" in v for v in _vals6)
+      and any("2026-09-28 09:00:00" in v for v in _vals6), _vals6)
+check("选项里写清了那一轮推荐了几篇",
+      any(v.startswith("2026-09-28 09:00:00") and "2 篇" in v for v in _vals6), _vals6)
+check("文件名后缀也带进标签了 (同一秒跑两轮也分得清)",
+      any(v.endswith("second") for v in _vals6), _vals6)
+check("最后一项是'全部累计记录 (N 篇)' (以前那个按钮的行为没丢)",
+      _vals6[-1].startswith(REC_ALL_PREFIX) and "2 篇" in _vals6[-1], _vals6[-1])
+
+_label_a = [v for v in _vals6 if v.startswith("2026-09-28")][0]
+_label_b = [v for v in _vals6 if v.startswith("2026-09-29")][0]
+
+# --- 选第一轮: 下面那张表必须换成那一轮的结果 ---
+app.var_rec_run.set(_label_a)
+app._on_rec_pick()
+app.update()
+_rows_a = app.tree.get_children()
+check("选第一轮后铺出 2 篇", len(_rows_a) == 2, len(_rows_a))
+check("铺的确实是**那一轮**的论文",
+      "第一轮的第一篇" in str(cell(app.tree, _rows_a[0], "title")),
+      cell(app.tree, _rows_a[0], "title"))
+check("第二轮那篇不在这一轮里",
+      all("第二轮" not in str(cell(app.tree, r, "title")) for r in _rows_a))
+check("总分用的是那一轮报告里的数",
+      cell(app.tree, _rows_a[0], "score") == "0.801",
+      cell(app.tree, _rows_a[0], "score"))
+check("这些是'从某一轮报告读回来的' (不是这一轮跑出来的)",
+      all(c.from_run for c in app.ranked), [c.from_run for c in app.ranked])
+check("模式记成了 run", app._rec_mode == "run", app._rec_mode)
+check("第一条自动选中", app.tree.selection() == (_rows_a[0],), app.tree.selection())
+
+_det6 = app.txt_detail.get("1.0", "end")
+check("详解里写出了那一轮的总分 (报告里有这个数, 照实写)",
+      "总分 0.801" in _det6, [ln for ln in _det6.splitlines() if "总分" in ln])
+check("详解里说明了这个分数是哪来的 (不是这一轮算的)",
+      "那一轮报告里的分数" in _det6, _det6[:200])
+check("报告里没有的三个细分数不列出来 (列出来就是三个 0.00)",
+      "相关 0.00" not in _det6, [ln for ln in _det6.splitlines() if "相关" in ln])
+check("解读从记录库里按 arXiv ID 挂回来了 (报告里没有解读)",
+      "记录库里存着的讲解。" in _det6, _det6[:300])
+check("没有解读的那篇直说'记录里只留了标题和分数'",
+      app.ranked[1].analyzed is False)
+
+# --- 选第二轮: 列表跟着换 (这就是用户要的那件事) ---
+app.var_rec_run.set(_label_b)
+app._on_rec_pick()
+app.update()
+_rows_b = app.tree.get_children()
+check("换到第二轮后列表变成那一轮的 1 篇", len(_rows_b) == 1, len(_rows_b))
+check("列表里是第一轮**没有**的那篇",
+      "第二轮的那一篇" in str(cell(app.tree, _rows_b[0], "title")),
+      cell(app.tree, _rows_b[0], "title"))
+check("上一轮的论文没有留在列表里",
+      all("第一轮" not in str(cell(app.tree, r, "title")) for r in _rows_b))
+
+# --- 切回'本次运行的结果': 原样还回来, 不重跑 ---
+_live6 = _C6(arxiv_id="2401.60001", title="这一轮跑出来的那篇")
+_live6.score = 0.9
+app._live_ranked = [_live6]
+app._live_top_ids = {"2401.60001"}
+app.var_rec_run.set(REC_LIVE)
+app._on_rec_pick()
+app.update()
+check("切回'本次运行的结果'后铺的是这一轮那份 (不是最后一次看的历史轮)",
+      [str(cell(app.tree, r, "title")) for r in app.tree.get_children()]
+      == ["这一轮跑出来的那篇"],
+      [str(cell(app.tree, r, "title")) for r in app.tree.get_children()])
+check("'推荐'标记也回来了 (top_ids 一起还的)",
+      has_flag(app.tree, app.tree.get_children()[0], "推荐"),
+      cell(app.tree, app.tree.get_children()[0], "flag"))
+check("模式记回了 live", app._rec_mode == "live", app._rec_mode)
+
+# --- 最后那一项 = 老的"推荐记录"按钮: 整库铺出来 ---
+app.var_rec_run.set(_vals6[-1])
+app._on_rec_pick()
+app.update()
+check("选'全部累计记录'铺的是整库 (两轮混在一起, 按记录排)",
+      len(app.tree.get_children()) == 2, len(app.tree.get_children()))
+check("模式记成了 all", app._rec_mode == "all", app._rec_mode)
+check("这一张表标成了'来自记录库'", app._tree_from_history is True)
+check("记录里每一条都是推荐过的, 不重复写'已推荐过'",
+      all(c.from_history for c in app.ranked))
+
+# --- 和 AI 深入讨论 ---
+from arxiv_rec import chat as _chat6
+
+_ai6 = {"client": None, "ensure": []}
+_orig_chat_ai = app._chat_ai
+_orig_ensure = _chat6.ensure_abstract
+app._chat_ai = lambda cfg: _ai6["client"]
+
+
+def _fake_ensure(cfg, cand, cache=None):
+    """假装去 arXiv 取摘要 —— 记一笔, 不联网。
+
+    取回来的摘要直接塞进候选对象 (和真实现一样), 顺带验"取回来之后详解面板
+    会跟着显示"这条链路。
+    """
+    _ai6["ensure"].append(str(getattr(cand, "arxiv_id", "")))
+    if not str(getattr(cand, "abstract", "") or ""):
+        cand.abstract = "从 arXiv 取回来的摘要。"
+        return True
+    return False
+
+
+_chat6.ensure_abstract = _fake_ensure
+
+# 文献库也换掉: 拼讨论上下文要用它, 而**真读一遍是 219 个 PDF 的全文解析**
+# (这台机器上四分钟起步)。讨论这一节要验的是"聊天怎么走、存哪、怎么写回详解",
+# 不是 PDF 解析 —— 那个在 C 节验。给几篇假的, 既快又可控。
+_orig_papers = app._chat_papers_cache
+_papers6 = [LibraryPaper(item_id=1, key="k1", title="Sign problem in QMC",
+                         abstract="Majorana positivity", year=2020,
+                         authors=["Wei Wang"], arxiv_id="2001.00001"),
+            LibraryPaper(item_id=2, key="k2", title="Pfaffian sign",
+                         abstract="Reformulating the Pfaffian sign", year=2019,
+                         authors=["Li Chen"], arxiv_id="1901.00001")]
+app._chat_papers_cache = lambda cfg: _papers6
+
+
+class _FakeChatAI:
+    """假 AI: 聊天给一段文字, 重写详解给一份 JSON。不打网络。"""
+
+    def __init__(self, fail=False):
+        self.fail = fail
+        self.calls = []
+        self.answer = "它把符号问题转成了一个可解的本征值问题。"
+        self.data = {
+            "summary": "按讨论重写的讲解。",
+            "connections": [{"paper": "编出来的标签 2099", "relation": "编的"}],
+            "ideas": "按讨论重写的新方向。",
+        }
+
+    def chat(self, system, user, json_mode=False, use_cache=True):
+        self.calls.append(("chat", system, user))
+        if self.fail:
+            raise RuntimeError("假的: 接口挂了")
+        return self.answer
+
+    def chat_json(self, system, user, default=None, use_cache=True):
+        self.calls.append(("json", system, user))
+        if self.fail:
+            raise RuntimeError("假的: 接口挂了")
+        return self.data
+
+
+def _pump(cond, secs=20.0):
+    """转事件循环 (主线程取队列全靠 after, 不转就不会有反应) 直到 cond 为真。"""
+    _t0 = time.time()
+    while time.time() - _t0 < secs:
+        app.update()
+        if cond():
+            return True
+        time.sleep(0.03)
+    return bool(cond())
+
+
+try:
+    # 铺出第一轮那两篇 —— 挑第一轮而不是第二轮: 这两篇**记录库里有**, 后面
+    # "更新详解只碰解读那几列"才有得比 (第二轮那篇是报告里新冒出来的, 记录里没有)。
+    app.var_rec_run.set(_label_a)
+    app._on_rec_pick()
+    app.update()
+
+    check("有对话区那个框 (和详解同一页)", hasattr(app, "txt_chat"))
+    check("有'用对话更新详解'按钮 (单独一个, 不是每聊一句就改)",
+          "更新详解" in str(app.btn_chat_detail.cget("text")),
+          app.btn_chat_detail.cget("text"))
+    check("有'清空这段对话'按钮", hasattr(app, "btn_chat_clear"))
+    check("有发送按钮", hasattr(app, "btn_chat_send"))
+
+    _aid6 = str(app.ranked[0].arxiv_id)
+    check("选中一篇之后, 对话区标题换成了这一篇",
+          _aid6 in app.var_chat_paper.get() or "正在讨论" in app.var_chat_paper.get(),
+          app.var_chat_paper.get())
+    check("没聊过时对话区给的是提示 (不是一片空白)",
+          "还没有聊过" in app.txt_chat.get("1.0", "end"),
+          app.txt_chat.get("1.0", "end")[:80])
+
+    # --- 发一句 ---
+    _ai6["client"] = _FakeChatAI()
+    app.var_chat_in.set("它的符号问题是怎么绕过去的?")
+    app.send_chat()
+    check("发出去之后输入框清空了", app.var_chat_in.get() == "",
+          app.var_chat_in.get())
+    check("等回复期间发送按钮置灰 (防连点)",
+          str(app.btn_chat_send.cget("state")) == "disabled",
+          app.btn_chat_send.cget("state"))
+    check("刚问的那句立刻显示出来了 (不等 AI)",
+          "它的符号问题是怎么绕过去的?" in app.txt_chat.get("1.0", "end"),
+          app.txt_chat.get("1.0", "end")[:200])
+    check("先落库再发: 用户那句在等回复时就已经存进记录了",
+          [m["content"] for m in
+           _lc6(app.cfg, _aid6)]
+          == ["它的符号问题是怎么绕过去的?"],
+          _lc6(app.cfg, _aid6))
+    check("发之前先补了摘要 (从报告里翻出来的论文手上没有摘要)",
+          _ai6["ensure"] and _ai6["ensure"][-1] == _aid6, _ai6["ensure"])
+
+    check("等到了 AI 的回复", _pump(lambda: app._chat_busy_aid == ""), "超时")
+    _chat_txt6 = app.txt_chat.get("1.0", "end")
+    check("回复显示在对话区里", "它把符号问题转成了一个" in _chat_txt6,
+          _chat_txt6[:400])
+    check("回复也存进了这篇论文的记录",
+          [m["content"] for m in
+           _lc6(app.cfg, _aid6)][-1]
+          == "它把符号问题转成了一个可解的本征值问题。",
+          _lc6(app.cfg, _aid6))
+    check("答完之后发送按钮恢复可点",
+          str(app.btn_chat_send.cget("state")) == "normal",
+          app.btn_chat_send.cget("state"))
+    check("取回摘要之后详解面板里也跟着显示出来了 (chat_meta 那条链路)",
+          "从 arXiv 取回来的摘要。" in app.txt_detail.get("1.0", "end"),
+          app.txt_detail.get("1.0", "end")[:400])
+    check("AI 拿到的上下文里有这篇论文的标题 (不是空手聊)",
+          any("第一轮的第一篇" in c[2] for c in _ai6["client"].calls),
+          [c[2][:60] for c in _ai6["client"].calls])
+
+    # --- 换一篇再换回来: 讨论还在 (这就是"存在这篇文献的记忆里") ---
+    # 这里**不动**列表的选中项: selection_set 会发出 <<TreeviewSelect>>, 而它
+    # 要等到 update() 才处理 —— 那一拍会把下面这次手动 _show_detail 覆盖掉。
+    app._show_detail(_C6(arxiv_id="2401.50009", title="换一篇看看"))
+    app.update()
+    check("换到别的论文时对话区跟着换 (不显示上一篇的讨论)",
+          "它的符号问题是怎么绕过去的?" not in app.txt_chat.get("1.0", "end"),
+          app.txt_chat.get("1.0", "end")[:120])
+    app.tree.selection_set("1")
+    app._on_select_candidate()
+    app.update()
+    check("换回来讨论还在 (关掉程序也还在, 它存在记录库里)",
+          "它把符号问题转成了一个" in app.txt_chat.get("1.0", "end"),
+          app.txt_chat.get("1.0", "end")[:300])
+
+    # --- 「用对话更新详解」: 用户点才更新 ---
+    _row6_before = {r["arxiv_id"]: r for r in
+                    _lrows6(app.cfg)}[_aid6]
+    check("聊完**没有**自动改详解 (详解还是记录里那份)",
+          "按讨论重写的讲解。" not in app.txt_detail.get("1.0", "end"),
+          app.txt_detail.get("1.0", "end")[:200])
+
+    app.update_detail_from_chat()
+    check("点下去之后按钮先置灰并写着'正在更新…'",
+          str(app.btn_chat_detail.cget("state")) == "disabled",
+          app.btn_chat_detail.cget("state"))
+    check("更新完了", _pump(lambda: app._chat_busy_aid == ""), "超时")
+    check("按钮恢复原样", str(app.btn_chat_detail.cget("state")) == "normal"
+          and str(app.btn_chat_detail.cget("text")) == "用对话更新详解",
+          (app.btn_chat_detail.cget("state"), app.btn_chat_detail.cget("text")))
+
+    _rows6_after = {r["arxiv_id"]: r for r in
+                    _lrows6(app.cfg)}
+    _row6 = _rows6_after[_aid6]
+    check("重写详解时把整场讨论都给了 AI (不然它只能凭摘要重写一遍)",
+          any(c[0] == "json" and "它的符号问题是怎么绕过去的?" in c[2]
+              and "它把符号问题转成了一个" in c[2]
+              for c in _ai6["client"].calls),
+          [(c[0], c[2][:80]) for c in _ai6["client"].calls])
+    check("新的详解写回了记录库", _row6["summary"] == "按讨论重写的讲解。",
+          _row6["summary"])
+    check("新的研究方向也写回去了", _row6["ideas"] == "按讨论重写的新方向。",
+          _row6["ideas"])
+    check("编出来的关联标签被丢掉了 (留下的关联必须真在文献库里)",
+          _row6["connections"] == "[]", _row6["connections"])
+    check("详解面板上显示的就是新那份",
+          "按讨论重写的讲解。" in app.txt_detail.get("1.0", "end"),
+          app.txt_detail.get("1.0", "end")[:300])
+    check("列表那一行的标记跟着亮起来 (不用重新铺表)",
+          has_flag(app.tree, app.tree.get_children()[0], "已解读"),
+          cell(app.tree, app.tree.get_children()[0], "flag"))
+    # 用户只点了"更新详解", 没跑推荐 —— 次数/分数/时间一个都不该动
+    check("推荐次数没被动过 (聊两句不该让次数涨)",
+          _row6["times"] == _row6_before["times"],
+          (_row6_before["times"], _row6["times"]))
+    check("最后推荐时间没被动过", _row6["last_at"] == _row6_before["last_at"],
+          (_row6_before["last_at"], _row6["last_at"]))
+    check("讨论本身没被这次更新清掉",
+          len(_lc6(app.cfg, _aid6)) == 2,
+          _lc6(app.cfg, _aid6))
+    check("上下文缓存作废了 (下一次提问要基于新的详解, 不是旧的)",
+          _aid6 not in app._chat_ctx, list(app._chat_ctx))
+
+    # --- 更新失败: 按钮必须回到可点的样子 (卡在'正在更新…'就再也点不动了) ---
+    _ai6["client"] = _FakeChatAI(fail=True)
+    app.update_detail_from_chat()
+    check("失败也算结束", _pump(lambda: app._chat_busy_aid == ""), "超时")
+    check("失败之后按钮仍然可点 (不能卡在'正在更新…')",
+          str(app.btn_chat_detail.cget("state")) == "normal"
+          and str(app.btn_chat_detail.cget("text")) == "用对话更新详解",
+          (app.btn_chat_detail.cget("state"), app.btn_chat_detail.cget("text")))
+    check("失败不会把好端端的详解改坏",
+          {r["arxiv_id"]: r for r in _lrows6(app.cfg)}[_aid6]["summary"] == "按讨论重写的讲解。")
+
+    # --- 追问失败: 对话区里写一行, 不弹对话框 (弹窗关掉用户那句就找不着了) ---
+    _dlg["err"] = 0
+    app.var_chat_in.set("再问一句")
+    app.send_chat()
+    check("追问失败也算结束", _pump(lambda: app._chat_busy_aid == ""), "超时")
+    check("失败写在对话区里 (不弹对话框)", _dlg["err"] == 0, _dlg["err"])
+    check("写明了这次没答上来",
+          "没答上来" in app.txt_chat.get("1.0", "end"),
+          app.txt_chat.get("1.0", "end")[-300:])
+    check("用户问的那句还看得见 (没有跟着一起消失)",
+          "再问一句" in app.txt_chat.get("1.0", "end"))
+    check("失败时用户那句仍然存着 (敲进去的字不该丢)",
+          any(m["content"] == "再问一句" for m in _lc6(app.cfg, _aid6)),
+          _lc6(app.cfg, _aid6))
+    check("失败不会往记录里塞一条假的 AI 回复",
+          not any(m["role"] == "assistant" and "没答上来" in m["content"]
+                  for m in _lc6(app.cfg, _aid6)))
+
+    # --- 还没聊过就点'更新详解': 说清楚, 别花冤枉钱 ---
+    # 换一个**干净**的假客户端: 上一条用的是 fail=True 那个, 它的 calls 本来就是空的,
+    # 拿它验"没调 AI"等于没验。
+    _ai6["client"] = _FakeChatAI()
+    app._show_detail(_C6(arxiv_id="2401.50077", title="没聊过的"))
+    app.update()
+    _dlg["info"] = 0
+    _dlg["info_text"] = ""
+    app.update_detail_from_chat()
+    check("没聊过就点'更新详解': 提示一句, 一次 AI 都没调",
+          _dlg["info"] == 1 and _ai6["client"].calls == [],
+          (_dlg["info"], _ai6["client"].calls))
+    check("提示里说清了要先聊几句", "先问几句" in _dlg["info_text"],
+          _dlg["info_text"][:120])
+
+    # --- 清空这一段对话 ---
+    app.tree.selection_set("1")
+    app._on_select_candidate()
+    app.update()
+    _dlg["answer"] = True
+    _dlg["ask"] = 0
+    app.clear_chat()
+    check("清空前先确认", _dlg["ask"] == 1, _dlg["ask"])
+    check("对话区空了", "再问一句" not in app.txt_chat.get("1.0", "end"),
+          app.txt_chat.get("1.0", "end")[:120])
+    check("记录库里的讨论也清了",
+          _lc6(app.cfg, _aid6) == [])
+    check("清讨论**不动**推荐记录 (详解还在)",
+          {r["arxiv_id"]: r for r in _lrows6(app.cfg)}[_aid6]["summary"] == "按讨论重写的讲解。")
+
+    # --- 没选论文就发 ---
+    app._show_detail(None)
+    app.update()
+    _dlg["info"] = 0
+    _dlg["info_text"] = ""
+    app.var_chat_in.set("对着空气说话")
+    app.send_chat()
+    check("没选论文就发: 提示先选一篇", _dlg["info"] == 1, _dlg["info"])
+    check("提示里说清了要选一篇", "选一篇" in _dlg["info_text"],
+          _dlg["info_text"][:80])
+finally:
+    app._chat_ai = _orig_chat_ai
+    app._chat_papers_cache = _orig_papers
+    _chat6.ensure_abstract = _orig_ensure
+    _ui.messagebox.askyesno = _real_ask6
+    _ui.messagebox.showinfo = _real_info6
+    _ui.messagebox.showerror = _real_err6
+
+# --- 报告被删掉之后, 下拉框里那一项要消失, 并退回'本次运行的结果' ---
+app.var_rec_run.set(_label_a)
+app._on_rec_pick()
+app.update()
+check("(前置) 现在停在第一轮上", app._rec_mode == "run", app._rec_mode)
+os.remove(_RUN_A)
+app.refresh_rec_runs()
+app.update()
+check("报告被删后下拉框里那一项也没了",
+      not any(v.startswith("2026-09-28") for v in app.cmb_rec_run.cget("values")),
+      app.cmb_rec_run.cget("values"))
+check("当前选中的那份不见了就退回'本次运行的结果'",
+      app.var_rec_run.get() == REC_LIVE, app.var_rec_run.get())
+check("退回时在日志里说了一声'找不到了' (不是悄悄换掉)",
+      "找不到了" in app.txt_run_log.get("1.0", "end"),
+      app.txt_run_log.get("1.0", "end")[-200:])
+
+# 收尾: 把这一节造的报告删掉, 别影响后面几节 (E2 会去挑"最新的一份报告")
+for _p6 in (_RUN_A, _RUN_B):
+    if os.path.exists(_p6):
+        os.remove(_p6)
+app._live_ranked = []
+app._live_top_ids = set()
+app.ranked = []
+app._tree_from_history = False
+app._fill_tree([], {})
+app._show_detail(None)
+app.refresh_rec_runs()
+for _ in range(3):
     app.update()
 
 print()

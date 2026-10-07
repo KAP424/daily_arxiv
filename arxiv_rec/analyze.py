@@ -127,8 +127,12 @@ class LibraryIndex:
 # --------------------------------------------------------------------------
 # 单篇解读
 # --------------------------------------------------------------------------
-def _candidate_block(cand: Candidate) -> str:
-    """候选论文在提示词里的呈现。"""
+def candidate_block(cand: Candidate) -> str:
+    """候选论文在提示词里的呈现。
+
+    (名字不带下划线是因为 chat.py 也要用它 —— 那边讨论的是同一篇论文, 呈现
+    方式必须一模一样, 否则"AI 在报告里看到的"和"AI 在对话里看到的"会不一样。)
+    """
     lines = [
         "标题: %s" % strip_latex(cand.title),
         "arXiv: %s" % cand.arxiv_id,
@@ -151,8 +155,12 @@ def _candidate_block(cand: Candidate) -> str:
     return "\n".join(lines)
 
 
-def _library_block(papers: List[LibraryPaper]) -> Tuple[str, List[str]]:
-    """你自己的文献在提示词里的呈现, 返回 (文本, 可用标签列表)。"""
+def library_block(papers: List[LibraryPaper]) -> Tuple[str, List[str]]:
+    """你自己的文献在提示词里的呈现, 返回 (文本, 可用标签列表)。
+
+    (同样不带下划线: chat.py 用同一套标签, 这样"用对话更新详解"给出的关联才能
+    和报告里的关联对得上 —— 两边各造一套标签, 同一篇文献会写出两个名字。)
+    """
     blocks = []
     labels = []
     for p in papers:
@@ -177,40 +185,17 @@ def _library_block(papers: List[LibraryPaper]) -> Tuple[str, List[str]]:
     return "\n".join(blocks), labels
 
 
-def analyze_one(
-    ai: AIClient,
-    cand: Candidate,
-    related: List[LibraryPaper],
-    profile: Optional[ResearchProfile] = None,
-) -> Dict[str, Any]:
-    """解读单篇候选论文。失败返回 {}。"""
-    lib_block, labels = _library_block(related)
+def normalize_result(result: Any, labels: Any) -> Dict[str, Any]:
+    """把 AI 返回的解读 JSON 规整成 ``{summary, connections, ideas}``。
 
-    parts = []
-    if profile is not None:
-        digest = profile_digest_for_scoring(profile)
-        if digest:
-            parts.append("研究者的研究方向:\n%s" % digest)
-    if lib_block:
-        parts.append("研究者已读的相关文献 (方括号内是引用标签):\n%s" % lib_block)
-    else:
-        parts.append("（研究者文献库中没有检索到明显相关的已有工作, "
-                     "connections 可以返回空数组）")
-    parts.append("需要解读的新论文:\n%s" % _candidate_block(cand))
-    parts.append(
-        "请完成三件事:\n"
-        "1. 讲解这篇论文的内容 (summary);\n"
-        "2. 指出它和上面哪些已读文献相关, paper 字段必须原样使用方括号里的标签 (connections);\n"
-        "3. 提出可以结合的研究方向 (ideas)。\n"
-        "严格按此 JSON 结构输出:\n%s" % ANALYZE_SCHEMA
-    )
-
-    result = ai.chat_json(ANALYZE_SYSTEM, "\n\n".join(parts), default=None)
+    主要是**校验标签**: AI 很容易顺手编一个不在文献库里的引用标签, 那种关联写
+    进报告就是凭空的。聊出来的解读 (chat.py) 走的也是这里 —— "什么算合法关联"
+    两边必须是同一套判断, 否则同一篇论文在两个地方会得到两种关联。
+    """
     if not isinstance(result, dict):
         return {}
 
-    # 校验标签, 防止 AI 编造不存在的文献
-    valid = set(labels)
+    valid = set(labels or ())
     connections = []
     for item in (result.get("connections") or []):
         if not isinstance(item, dict):
@@ -233,6 +218,38 @@ def analyze_one(
         "connections": connections,
         "ideas": str(result.get("ideas") or "").strip(),
     }
+
+
+def analyze_one(
+    ai: AIClient,
+    cand: Candidate,
+    related: List[LibraryPaper],
+    profile: Optional[ResearchProfile] = None,
+) -> Dict[str, Any]:
+    """解读单篇候选论文。失败返回 {}。"""
+    lib_block, labels = library_block(related)
+
+    parts = []
+    if profile is not None:
+        digest = profile_digest_for_scoring(profile)
+        if digest:
+            parts.append("研究者的研究方向:\n%s" % digest)
+    if lib_block:
+        parts.append("研究者已读的相关文献 (方括号内是引用标签):\n%s" % lib_block)
+    else:
+        parts.append("（研究者文献库中没有检索到明显相关的已有工作, "
+                     "connections 可以返回空数组）")
+    parts.append("需要解读的新论文:\n%s" % candidate_block(cand))
+    parts.append(
+        "请完成三件事:\n"
+        "1. 讲解这篇论文的内容 (summary);\n"
+        "2. 指出它和上面哪些已读文献相关, paper 字段必须原样使用方括号里的标签 (connections);\n"
+        "3. 提出可以结合的研究方向 (ideas)。\n"
+        "严格按此 JSON 结构输出:\n%s" % ANALYZE_SCHEMA
+    )
+
+    result = ai.chat_json(ANALYZE_SYSTEM, "\n\n".join(parts), default=None)
+    return normalize_result(result, labels)
 
 
 # --------------------------------------------------------------------------

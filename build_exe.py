@@ -49,6 +49,21 @@ CPU 各带一套内核 (avx512 / avx2 / avx / mc / ...), 加起来 600 MB 上下
 
 **不要**手工去删那些 mkl_*.dll: MKL 靠它们适配 CPU, 删掉在你机器上能跑,
 换台机器就会 "DLL load failed"。要么留着, 要么用 ``--venv`` 从根上换掉。
+
+体积和启动速度: 两个开关 (都默认开着, 不用管)
+--------------------------------------------------------------------------
+1. ``--optimize 2``: 收集进来的字节码去掉 docstring 和 assert。PYZ 实测小
+   33% (7.29 MB → 4.9 MB 上下)。
+2. ``build_hooks/hook-_tkinter.py``: 顶掉 PyInstaller 自带的 tkinter hook,
+   不收 Tcl/Tk 的时区表和多语言消息 —— 749 个文件 (全部条目的一大半), 但只有
+   0.9 MB。单文件 exe 每次启动都要把这些文件解到临时目录, 所以省的是**启动
+   时间**, 不是体积。
+
+**不开 UPX** (命令行里显式写了 ``--noupx``): 它会把打进包里的 dll / pyd 再压
+一遍, 体积能小几 MB, 但每个 dll 被加载时都要先在内存里解一遍 —— 启动变慢。
+而且单文件包本身已经是 zlib 压缩的, UPX 是在压缩过的数据上再压一遍, 榨不出
+多少, 却每次启动都要付账。本机没装 UPX, 这个开关眼下是空操作; 写上是为了别
+哪天有人装上了、悄悄把启动拖慢。
 """
 
 from __future__ import annotations
@@ -64,6 +79,11 @@ import tempfile
 ROOT = os.path.dirname(os.path.abspath(__file__))
 ENTRY = os.path.join(ROOT, "ui.py")
 NAME = "daily_arxiv"
+# 赞赏码 ("支持一下"页显示的那张)。打进 exe 里, 这样光一个 exe 拷到别的机器上
+# 也能显示出来; 构建完还会再抄一份到 exe 旁边, 让用户看得见、也换得掉。
+REWARD_SRC = os.path.join(ROOT, "reward.png")
+# 放自定义 hook 的目录 (见 build_hooks/hook-_tkinter.py)
+HOOKS_DIR = os.path.join(ROOT, "build_hooks")
 
 # 这些包在这台机器上装着, 但本程序一行都没用到。不排除的话 PyInstaller 有
 # 可能顺着某个间接引用把它们整包拖进来 —— 光 matplotlib + pandas 就是上百 MB。
@@ -80,6 +100,13 @@ EXCLUDES = [
     # 这些是明确的测试包, 运行时不会被 import
     "tkinter.test", "sklearn.tests", "scipy.tests", "numpy.tests",
 ]
+
+# 就这些了 —— **别再往下加**。实测一条 ``import sklearn.feature_extraction.text``
+# 就把 433 个 scipy 子模块 (含 scipy.linalg, 它链着 scipy 自己那份 OpenBLAS)、
+# asyncio、pydoc、multiprocessing、unittest、difflib 全拖进内存 —— scipy /
+# sklearn / numpy 的 import 链密到"看着没用"的模块其实都在路上。剩下那些真的
+# 没人 import 的 (pdb + doctest + tarfile + optparse) 加起来 95 KB, 占 exe 的
+# 0.12%, 换不来一次静默降级的风险 (见上面 unittest 那一段)。
 
 
 def log(msg: str) -> None:
@@ -168,7 +195,7 @@ def warn_bloated_build(packer: str) -> None:
     log("    %s" % packer)
     log("")
     log("conda 的 numpy/scipy 链的是 Intel MKL, 打出来的 exe 会大 3 倍多")
-    log("(实测 283 MB, 而 --venv 出来是 77 MB)。功能没有任何区别。")
+    log("(实测 283 MB, 而 --venv 出来是 74 MB)。功能没有任何区别。")
     log("")
     log("想要小体积, 加一个 --venv:")
     log("")
@@ -392,6 +419,45 @@ def _restore_data(saved, target_dir: str):
     return done
 
 
+def pyinstaller_cmd(packer: str, dist: str, build: str,
+                    args: argparse.Namespace) -> list:
+    """拼出这次要跑的 PyInstaller 命令行。
+
+    单独抽出来是为了能被**直接断言** (见 selftest 第 36 节): 这里面的
+    ``--optimize 2`` 和 ``--additional-hooks-dir`` 都是"丢了不报错"的开关 ——
+    功能一点不差, 只是 exe 又大回去、启动又慢回去, 而没有人会去查"为什么大了
+    几兆"。放进 main() 里就没法在不起子进程、不装 PyInstaller 的情况下验它。
+    """
+    cmd = [packer, "-m", "PyInstaller",
+           "--noconfirm", "--clean",
+           "--name", NAME,
+           "--onedir" if args.onedir else "--onefile",
+           "--console" if args.console else "--windowed",
+           # 收集进来的字节码去掉 docstring 和 assert: PYZ 小 33% (7.29 → 4.9 MB)。
+           # 已经单独打过一个 -OO 的探针 exe 验证过依赖全都活着 (sklearn 的
+           # TF-IDF + 余弦、numpy/scipy、PyMuPDF 开真 PDF、本程序自己的
+           # pdf_library.read_pdf_library), 见模块开头那段说明。
+           "--optimize", "2",
+           # 显式关掉 UPX: 它省体积但拖慢启动, 见模块开头。
+           "--noupx",
+           # 让 PyInstaller 能找到 arxiv_rec 包 (脚本在项目根目录)
+           "--paths", ROOT,
+           "--distpath", dist,
+           "--workpath", build,
+           "--specpath", build]
+    for mod in EXCLUDES:
+        cmd += ["--exclude-module", mod]
+    # 顶掉 PyInstaller 自带的 tkinter hook, 不收 Tcl/Tk 的时区表和多语言消息
+    # (749 个文件, 见 build_hooks/hook-_tkinter.py 里的说明)。这个目录的优先级
+    # 高于自带 hooks, 同名 hook 只留优先级高的那一份 —— 是替换, 不是叠加。
+    if os.path.isdir(HOOKS_DIR):
+        cmd += ["--additional-hooks-dir", HOOKS_DIR]
+    if os.path.exists(REWARD_SRC):
+        cmd += ["--add-data", REWARD_SRC + os.pathsep + "."]
+    cmd.append(ENTRY)
+    return cmd
+
+
 def main(argv=None) -> int:
     args = parse_args(argv)
 
@@ -462,25 +528,7 @@ def main(argv=None) -> int:
                 log("有东西没放回去, 备份留在 %s。" % stash_dir)
         return 1
 
-    cmd = [packer, "-m", "PyInstaller",
-           "--noconfirm", "--clean",
-           "--name", NAME,
-           "--onedir" if args.onedir else "--onefile",
-           "--console" if args.console else "--windowed",
-           # 让 PyInstaller 能找到 arxiv_rec 包 (脚本在项目根目录)
-           "--paths", ROOT,
-           "--distpath", dist,
-           "--workpath", build,
-           "--specpath", build]
-    for mod in EXCLUDES:
-        cmd += ["--exclude-module", mod]
-    # 赞赏码 ("支持一下"页显示的那张)。打进 exe 里, 这样光一个 exe 拷到别的
-    # 机器上也能显示出来 —— 不带的话那页会是一句"没找到图片"。
-    # 下面还会再抄一份到 exe 旁边, 让用户看得见、也能自己换一张。
-    reward_src = os.path.join(ROOT, "reward.png")
-    if os.path.exists(reward_src):
-        cmd += ["--add-data", reward_src + os.pathsep + "."]
-    cmd.append(ENTRY)
+    cmd = pyinstaller_cmd(packer, dist, build, args)
 
     log("=" * 68)
     log("打包 %s (%s, %s)" % (NAME,
@@ -507,11 +555,12 @@ def main(argv=None) -> int:
         return 1
 
     # --- 赞赏码也放一份在 exe 旁边 ---
-    # 它已经打进 exe 里了 (见上面 --add-data), 这里再放一份是为了两件事: 界面
-    # 上会显示这个文件的实际路径, 以及"想换一张赞赏码"的人可以直接替换它。
-    if os.path.exists(reward_src):
+    # 它已经打进 exe 里了 (见 pyinstaller_cmd 里的 --add-data), 这里再放一份是为了
+    # 两件事: 界面上会显示这个文件的实际路径, 以及"想换一张赞赏码"的人可以直接
+    # 替换它。
+    if os.path.exists(REWARD_SRC):
         try:
-            shutil.copyfile(reward_src, os.path.join(target_dir, "reward.png"))
+            shutil.copyfile(REWARD_SRC, os.path.join(target_dir, "reward.png"))
             log("")
             log("已把 reward.png 放到 %s (「支持一下」页显示的那张)。" % target_dir)
         except Exception as exc:

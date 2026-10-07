@@ -201,6 +201,16 @@ def apply(root: Any, family: str, base_size: int = 10) -> None:
     style.map("Quiet.TButton",
               background=[("active", "#f3f4f6"), ("disabled", BG)],
               foreground=[("disabled", DISABLED_FG)])
+    # 同一个"次要动作", 摆在**卡片里**的时候。卡片是白底, 而 Quiet.TButton 的
+    # 底色是页面灰 —— 直接摆进去就是白卡片上的一块灰方块 (check_backgrounds
+    # 一秒钟就抓出来了)。其余颜色照抄, 只把底色换成卡片白。
+    style.configure("CardQuiet.TButton", background=SURFACE, foreground=MUTED,
+                    bordercolor=BORDER, lightcolor=SURFACE, darkcolor=SURFACE,
+                    relief="solid", borderwidth=1, focusthickness=0,
+                    padding=(12, 6))
+    style.map("CardQuiet.TButton",
+              background=[("active", "#f3f4f6"), ("disabled", SURFACE)],
+              foreground=[("disabled", DISABLED_FG)])
     # 顶栏那条带子自己也要配 —— 漏了它, lookup 会一路退到基类 "." 的页面灰,
     # 顶栏就根本不变色 (而且顶栏上的控件全都配了 HEADER_BG, 反而变成
     # "浅蓝控件摆在灰底上", 比不美化还难看)。这个漏配是 check_backgrounds

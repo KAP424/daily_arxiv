@@ -1,7 +1,10 @@
 # -*- coding: utf-8 -*-
 """针对 daily_arxiv 高风险逻辑的自查测试。"""
 import sys, os
-sys.path.insert(0, r"C:\Users\admin\Desktop\daily_arxiv")
+# 按**本文件所在目录**找 arxiv_rec, 不写死路径。这里原来写的是项目搬到 D 盘之前
+# 那个桌面目录, 搬完就成了死路径 —— 它排在 sys.path 最前面, 哪天那个目录又被
+# 建出来 (哪怕放的是旧代码), 这个自查就会静默地测到旧版本上去。
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from datetime import datetime, timedelta
 from arxiv_rec.utils import (extract_arxiv_id, parse_arxiv_date, normalize_title,
                              norm_doi, truncate, safe_json_loads, strip_latex,
@@ -2552,7 +2555,8 @@ from arxiv_rec.history import (RecommendHistory as _RH32,
                                load_records as _load32,
                                rows_as_candidates as _rows32)
 
-# 「推荐记录」按钮不再删记录了, 而是把 recommend_history.sqlite 铺成下面的列表。
+# 铺记录这件事不再删记录了 (删是旁边那个按钮), 而是把 recommend_history.sqlite
+# 铺成下面的列表。
 # 这条路上有两件容易做错的事, 这里各测一遍:
 #   * 老库 (v1 结构, 没有 authors/published/... 那五列) 必须**加列**迁移, 绝不能
 #     学 pdf_library 那套"版本变了就 DROP TABLE" —— 那是用户攒的历史, 不是缓存
@@ -2756,7 +2760,7 @@ print()
 print("=" * 70)
 print("33) 老记录缺的作者/日期/期刊: 按 ID 从 arXiv 补回来并写回库")
 print("=" * 70)
-# 用户报的现象: 点「推荐记录」, 列表里作者/提交日期/期刊三列全空。
+# 用户报的现象: 铺一遍推荐记录, 列表里作者/提交日期/期刊三列全空。
 # 根因有两层: (1) 那五列是后来才加的, 老记录里一律空着; (2) 报告是兜底数据源,
 # 而报告存在 output/ 里, 会被清理掉 —— 于是兜底也没得兜。
 # 这一段钉住第三层兜底 (按 arXiv ID 问一次) 的三个要点:
@@ -2780,7 +2784,7 @@ try:
                       authors=["C. Author"], published=_dt33(2024, 1, 3)),
             Candidate(arxiv_id="2401.00004", title="也是两样都缺"),
             # 这一条**故意**让下面那次假的联网取不到 (见 33d): 它必须继续算"缺",
-            # 否则一条补不上的记录会被静默忘掉, 下次点「推荐记录」再也不试了
+            # 否则一条补不上的记录会被静默忘掉, 下次铺记录再也不试了
             Candidate(arxiv_id="2401.00005", title="补不回来的那条"),
         ], profile_fp="fp")
 
@@ -2993,6 +2997,344 @@ try:
           _be34._remove_dir_safely(_lock34) == "" and not os.path.isdir(_lock34))
 finally:
     _sh.rmtree(_tmp34, ignore_errors=True)
+
+print()
+print("=" * 70)
+print("35) 和 AI 的讨论: 存哪、读哪、怎么变成详解")
+print("=" * 70)
+# 「文献推荐」页那个讨论框的三条底线:
+#   * 讨论**按论文**存 (chat 表), 换一篇、关掉程序再打开都还在
+#   * 「用对话更新详解」只碰解读那几列 —— 推荐次数/分数/时间一个字都不许动
+#     (聊两句就把次数加一, 用户会以为"我只问了两个问题, 怎么推荐次数涨了")
+#   * 写回去的解读带上画像指纹, 下一轮跑推荐时才能按"画像没变"复用, 不白花 token
+import tempfile as _tf35
+import shutil as _sh35
+import json as _js35
+import sqlite3 as _sq35
+from arxiv_rec import history as _hist35
+from arxiv_rec.models import Candidate as _C35
+from arxiv_rec.models import LibraryPaper as _P35
+from arxiv_rec.history import RecommendHistory as _RH35
+
+_tmp35 = _tf35.mkdtemp(prefix="daily_arxiv_selftest35_")
+try:
+    _db35 = os.path.join(_tmp35, "h.sqlite")
+    _cfg35 = {"analysis": {"history_db": _db35, "use_history": True}}
+
+    # --- 35a) 看讨论是只读的: 库不在就给空, 不建库 ---
+    check("库文件不存在时读讨论给空列表",
+          _hist35.load_chat(_cfg35, "2401.00001") == [])
+    check("而且不会顺手把库文件建出来 (看一眼不该在盘上多出个文件)",
+          not os.path.exists(_db35))
+    check("空 arxiv_id 也是空列表 (不抛)", _hist35.load_chat(_cfg35, "") == [])
+
+    # --- 35b) 追加 / 读回: 顺序、角色、按论文隔离 ---
+    check("追加一条用户消息能成功",
+          _hist35.append_chat(_cfg35, "2401.00001", "user", "它的符号问题怎么处理的?"))
+    check("空白内容不写 (返回 False)",
+          not _hist35.append_chat(_cfg35, "2401.00001", "user", "   "))
+    check("空 arxiv_id 不写",
+          not _hist35.append_chat(_cfg35, "", "user", "x"))
+    _hist35.append_chat(_cfg35, "2401.00001", "assistant", "它用一个变换绕过去了。")
+    _hist35.append_chat(_cfg35, "2401.00002", "user", "另一篇的问题")
+
+    _m35 = _hist35.load_chat(_cfg35, "2401.00001")
+    check("读回来是这一篇的两条, 顺序是问在前答在后",
+          [m.get("role") for m in _m35] == ["user", "assistant"],
+          [m.get("role") for m in _m35])
+    check("内容一字不差 (前后空白也没被吃掉)",
+          _m35[0].get("content") == "它的符号问题怎么处理的?", _m35[0])
+    check("讨论按论文隔离 (另一篇只有自己那一条)",
+          len(_hist35.load_chat(_cfg35, "2401.00002")) == 1,
+          _hist35.load_chat(_cfg35, "2401.00002"))
+    check("时间戳写上了", len(str(_m35[0].get("at") or "")) >= 16,
+          _m35[0].get("at"))
+    check("chat_summary 数得对 (3 条消息 / 2 篇论文)",
+          "3 条消息" in _hist35.chat_summary(_cfg35)
+          and "2 篇" in _hist35.chat_summary(_cfg35),
+          _hist35.chat_summary(_cfg35))
+    check("库文件不存在时 chat_summary 说'还没有'",
+          "还没有" in _hist35.chat_summary({"analysis": {"history_db":
+                                                         os.path.join(_tmp35, "无.sqlite")}}))
+
+    # --- 35c) 清空某篇的讨论: 只清这一篇, 别的照旧 ---
+    _n35 = _hist35.clear_chat(_cfg35, "2401.00001")
+    check("清空返回删了几条", _n35 == 2, _n35)
+    check("这一篇清干净了", _hist35.load_chat(_cfg35, "2401.00001") == [])
+    check("另一篇一条没少 (清一段对话不该波及别的论文)",
+          len(_hist35.load_chat(_cfg35, "2401.00002")) == 1)
+    check("再清一次返回 0 (不抛)", _hist35.clear_chat(_cfg35, "2401.00001") == 0)
+
+    # --- 35d) 讨论**关掉推荐记录**时也照样存 ---
+    # 记录那个开关管的是"跑完一轮要不要把推荐结果记下来"; 讨论是用户当场敲的字,
+    # 不该因为另一个开关而静默丢掉。
+    _cfg35b = {"analysis": {"history_db": _db35, "use_history": False}}
+    check("'使用推荐记录'关着时讨论照样写得进去",
+          _hist35.append_chat(_cfg35b, "2401.00003", "user", "关着也存"))
+    check("关着时也读得回来",
+          len(_hist35.load_chat(_cfg35b, "2401.00003")) == 1)
+
+    # --- 35e) 写回解读: 只碰解读那几列 ---
+    with _RH35(_db35) as _h35:
+        _h35.record([_C35(arxiv_id="2401.00001", title="讨论过的那篇",
+                          score=0.812, summary="", analyzed=False)],
+                    report_path="", profile_fp="fp-旧")
+    _row35 = {r["arxiv_id"]: r for r in _hist35.load_rows(_cfg35)}["2401.00001"]
+    _times35, _score35, _last35 = _row35["times"], _row35["best_score"], _row35["last_at"]
+
+    _c35 = _C35(arxiv_id="2401.00001", title="讨论过的那篇")
+    _c35.summary = "聊完之后重写的讲解。"
+    _c35.connections = [{"paper": "Wang 2020", "relation": "方法同源"}]
+    _c35.ideas = "可以拿来验证。"
+    _c35.analyzed = True
+    check("写回解读成功", _hist35.save_analysis(_cfg35, _c35, "fp-新"))
+
+    _row35b = {r["arxiv_id"]: r for r in _hist35.load_rows(_cfg35)}["2401.00001"]
+    check("解读写进去了", _row35b["summary"] == "聊完之后重写的讲解。",
+          _row35b["summary"])
+    check("关联写进去了 (JSON 往返)",
+          _js35.loads(_row35b["connections"]) == [{"paper": "Wang 2020",
+                                                   "relation": "方法同源"}],
+          _row35b["connections"])
+    check("analyzed 置成 1 了", bool(_row35b["analyzed"]))
+    check("画像指纹换成了新的 (下次跑推荐才能按它复用)",
+          _row35b["profile_fp"] == "fp-新", _row35b["profile_fp"])
+    # 这三条是这次改动的重点: 用户只点了「用对话更新详解」, 没有跑推荐
+    check("推荐次数**没被动过**",
+          _row35b["times"] == _times35, (_times35, _row35b["times"]))
+    check("分数没被动过", _row35b["best_score"] == _score35,
+          (_score35, _row35b["best_score"]))
+    check("最后推荐时间没被动过", _row35b["last_at"] == _last35,
+          (_last35, _row35b["last_at"]))
+    check("标题也没被覆盖", _row35b["title"] == "讨论过的那篇", _row35b["title"])
+
+    # --- 35f) 写回的解读要能被下一轮复用 ---
+    _c35b = _C35(arxiv_id="2401.00001", title="讨论过的那篇")
+    check("同一画像下, 写回的解读能被复用 (不白花 token)",
+          _RH35.reuse_analysis(_c35b, _row35b, "fp-新")
+          and _c35b.summary == "聊完之后重写的讲解。", _c35b.summary)
+    _c35c = _C35(arxiv_id="2401.00001", title="讨论过的那篇")
+    check("画像变了就不复用", not _RH35.reuse_analysis(_c35c, _row35b, "fp-别的"))
+
+    # --- 35g) 论文不在记录里时, 写回要**补建一条** (而不是悄悄丢掉) ---
+    _c35d = _C35(arxiv_id="2401.99999", title="记录里没有的这篇")
+    _c35d.summary = "补建出来的讲解。"
+    _c35d.ideas = "想法"
+    check("记录里没有这篇时写回也返回成功",
+          _hist35.save_analysis(_cfg35, _c35d, "fp-新"))
+    _rows35 = {r["arxiv_id"]: r for r in _hist35.load_rows(_cfg35)}
+    check("补建出来了", "2401.99999" in _rows35, sorted(_rows35))
+    check("补建的那条次数是 1 (不能凭空写成好几次)",
+          int(_rows35["2401.99999"]["times"]) == 1,
+          _rows35["2401.99999"]["times"])
+    check("补建的那条带着标题", _rows35["2401.99999"]["title"] == "记录里没有的这篇",
+          _rows35["2401.99999"]["title"])
+    check("补建没有把原来那篇的解读冲掉",
+          _rows35["2401.00001"]["summary"] == "聊完之后重写的讲解。",
+          _rows35["2401.00001"]["summary"])
+    check("讨论记录也没被写回解读这件事碰到",
+          len(_hist35.load_chat(_cfg35, "2401.00002")) == 1)
+
+    # --- 35h) 清空推荐记录时, 讨论一起删 (否则那些对话在界面上再也点不到) ---
+    _hist35.append_chat(_cfg35, "2401.00001", "user", "会被一起删掉的一句")
+    with _RH35(_db35) as _h35c:
+        _h35c.clear()
+    check("推荐记录清空了", _hist35.load_rows(_cfg35) == [])
+    check("讨论也跟着清空了",
+          _hist35.load_chat(_cfg35, "2401.00001") == []
+          and _hist35.load_chat(_cfg35, "2401.00002") == [],
+          (_hist35.load_chat(_cfg35, "2401.00001"),
+           _hist35.load_chat(_cfg35, "2401.00002")))
+
+    # --- 35i) 老库 (v2, 没有 chat 表) 打开时要能自己长出这张表 ---
+    _old35 = os.path.join(_tmp35, "old.sqlite")
+    _c35o = _sq35.connect(_old35)
+    _c35o.executescript("""
+    CREATE TABLE recommended (
+        arxiv_id TEXT PRIMARY KEY, title TEXT NOT NULL DEFAULT '',
+        first_at TEXT NOT NULL DEFAULT '', last_at TEXT NOT NULL DEFAULT '',
+        times INTEGER NOT NULL DEFAULT 0, best_score REAL NOT NULL DEFAULT 0,
+        report TEXT NOT NULL DEFAULT '', profile_fp TEXT NOT NULL DEFAULT '',
+        summary TEXT NOT NULL DEFAULT '', connections TEXT NOT NULL DEFAULT '[]',
+        ideas TEXT NOT NULL DEFAULT '', analyzed INTEGER NOT NULL DEFAULT 0);
+    INSERT INTO recommended (arxiv_id, title) VALUES ('2401.00007', '老库里的那篇');
+    """)
+    _c35o.commit()
+    _c35o.close()
+    _cfg35o = {"analysis": {"history_db": _old35, "use_history": True}}
+    check("老库打开后能写讨论 (chat 表自己长出来了)",
+          _hist35.append_chat(_cfg35o, "2401.00007", "user", "老库也能聊"))
+    check("老库的推荐记录一条没丢",
+          len(_hist35.load_rows(_cfg35o)) == 1,
+          _hist35.load_rows(_cfg35o))
+    check("老库读讨论读得回来",
+          len(_hist35.load_chat(_cfg35o, "2401.00007")) == 1)
+
+    # --- 35j) 讨论拼提示词: 超预算时丢的是**最早**那几条 ---
+    from arxiv_rec import chat as _chat35
+    _msgs35 = [{"role": "user", "content": "早" * 400},
+               {"role": "assistant", "content": "中" * 400},
+               {"role": "user", "content": "刚问的这一句"}]
+    _full35 = _chat35.transcript_text(_msgs35)
+    check("正常预算下三句都在",
+          "早" in _full35 and "中" in _full35 and "刚问的这一句" in _full35,
+          _full35[:80])
+    check("角色写成了 研究者 / 你",
+          _full35.startswith("研究者: ") and "你: " in _full35, _full35[:40])
+    _cut35 = _chat35.transcript_text(_msgs35, budget=200)
+    check("超预算时**最新**那一句必须留下 (截掉最新的等于白聊)",
+          "刚问的这一句" in _cut35, _cut35)
+    check("超预算时丢掉的是最早那一句", "早" not in _cut35, _cut35)
+    check("空消息列表给空串", _chat35.transcript_text([]) == "")
+    check("内容为空的那几条被跳过",
+          _chat35.transcript_text([{"role": "user", "content": "  "}]) == "")
+
+    # --- 35k) 讨论的上下文: 画像 + 相关文献标签 + 这篇论文 + 已有解读 ---
+    _p35 = [_P35(item_id=1, key="k1", title="Sign problem in QMC",
+                 abstract="Majorana positivity", year=2020,
+                 authors=["Wei Wang"], arxiv_id="2001.00001"),
+            _P35(item_id=2, key="k2", title="Something else",
+                 abstract="unrelated", year=2019,
+                 authors=["Li Chen"], arxiv_id="1901.00001")]
+    # 标题/摘要用英文写: 相关文献预筛是 TF-IDF, 中文查询和英文文献库词表零重叠,
+    # 筛出来会是空 —— 那样"有标签可用"这条断言测的就不是它想测的东西了。
+    _cand35 = _C35(arxiv_id="2401.00001",
+                   title="Sign problem and Majorana positivity in Monte Carlo",
+                   abstract="We study the Majorana sign problem in quantum "
+                            "Monte Carlo simulations.")
+    _cand35.summary = "已有的解读。"
+    _cand35.ideas = "已有的想法。"
+    _cand35.connections = [{"paper": "Wang 2020", "relation": "方法同源"}]
+    _pre35, _labels35 = _chat35.build_context(
+        {"analysis": {"related_papers_k": 2}}, _cand35, papers=_p35)
+    check("上下文里有这篇论文的标题和摘要",
+          "Majorana positivity in Monte Carlo" in _pre35
+          and "quantum Monte Carlo simulations" in _pre35, _pre35[:200])
+    check("上下文里给出了可引用的文献标签", bool(_labels35), _labels35)
+    check("上下文里带上了已有的解读 (不给的话 AI 会把讲过的再讲一遍)",
+          "已有的解读。" in _pre35 and "方法同源" in _pre35, _pre35[:200])
+    check("标签确实出现在上下文里 (给了标签就得能用)",
+          _labels35 and _labels35[0] in _pre35, _labels35[:1])
+
+    _pre35b, _labels35b = _chat35.build_context(
+        {"analysis": {}}, _cand35, papers=[])
+    check("文献库是空的时也拼得出来 (只是没有相关文献那一段)",
+          "Majorana positivity" in _pre35b and _labels35b == [], _labels35b)
+    _cand35b = _C35(arxiv_id="2401.00002", title="还没解读过的那篇",
+                    abstract="摘要")
+    _pre35c, _ = _chat35.build_context({"analysis": {}}, _cand35b, papers=[])
+    check("没有解读时那段就不出现 (不是硬塞一句空的)",
+          "目前的解读" not in _pre35c, _pre35c[:200])
+
+    # --- 35l) 关联标签的校验: 编出来的标签一律丢掉 ---
+    from arxiv_rec.analyze import normalize_result as _nr35
+    _res35 = _nr35({"summary": "讲解", "ideas": "想法", "connections": [
+        {"paper": "Wang 2020", "relation": "在库里"},
+        {"paper": "[Wang 2020]", "relation": "带了方括号, 宽松匹配该认"},
+        {"paper": "根本不存在 2099", "relation": "编的, 必须丢"},
+        {"paper": "Wang 2020", "relation": ""},
+        "不是字典",
+    ]}, ["Wang 2020"])
+    check("合法标签留下", _res35["connections"][0]["paper"] == "Wang 2020",
+          _res35["connections"])
+    check("带了方括号的也认 (AI 很爱多写一对括号)",
+          len(_res35["connections"]) == 2
+          and _res35["connections"][1]["paper"] == "Wang 2020",
+          _res35["connections"])
+    check("编出来的标签被丢掉 (写进报告就是凭空的关联)",
+          all(c["paper"] != "根本不存在 2099" for c in _res35["connections"]))
+    check("没有 relation 的丢掉", len(_res35["connections"]) == 2,
+          _res35["connections"])
+    check("不是 dict 的丢掉", all(isinstance(c, dict) for c in _res35["connections"]))
+    check("不是 dict 的整个结果给空 dict (不抛)", _nr35(None, []) == {})
+    check("文献库为空时所有关联都被丢掉",
+          _nr35({"connections": [{"paper": "Wang 2020", "relation": "x"}]},
+                [])["connections"] == [])
+
+    # --- 35m) 有摘要就别再去 arXiv 取 (离线也必须能过) ---
+    _cand35c = _C35(arxiv_id="2401.00001", title="T", abstract="已经有摘要了")
+    check("手上已有摘要 -> 直接返回 True, 一次网都不打",
+          _chat35.ensure_abstract({"network": {}}, _cand35c) is True)
+    check("没有 arxiv_id -> False (不抛)",
+          _chat35.ensure_abstract({"network": {}},
+                                  _C35(arxiv_id="", title="T")) is False)
+finally:
+    _sh35.rmtree(_tmp35, ignore_errors=True)
+
+print()
+print("=" * 70)
+print("36) 打包开关: 体积和启动的优化不能被悄悄关掉")
+print("=" * 70)
+# 这一节盯的是 build_exe.py 里那几个**只影响体积和启动速度、不影响功能**的开关。
+# 它们最危险的地方是"丢了不报错": --optimize 2 掉了, exe 大回去 2 MB; build_hooks/
+# 里那个 hook 被删了, 悄悄退回 PyInstaller 自带的那份, 多收 749 个文件。功能一点
+# 不差, 只是又大又慢 —— 而"又大又慢"没有人会去查, 只会觉得"这程序本来就这么大"。
+import build_exe as _be36
+
+# --- 36a) 命令行里那几个开关 ---
+_cmd36 = _be36.pyinstaller_cmd(sys.executable, "X/dist", "X/build",
+                               _be36.parse_args([]))
+check("命令行里有 --optimize 2",
+      "--optimize" in _cmd36 and _cmd36[_cmd36.index("--optimize") + 1] == "2",
+      _cmd36)
+check("命令行里有 --noupx (省体积但拖慢启动, 明确不要)", "--noupx" in _cmd36)
+check("命令行里带了自定义 hook 目录",
+      "--additional-hooks-dir" in _cmd36 and _be36.HOOKS_DIR in _cmd36, _cmd36)
+check("ui.py 还是最后那个位置参数", _cmd36[-1] == _be36.ENTRY, _cmd36[-1])
+check("默认仍是 --onefile + --windowed",
+      "--onefile" in _cmd36 and "--windowed" in _cmd36, _cmd36)
+_cmd36b = _be36.pyinstaller_cmd(sys.executable, "X/dist", "X/build",
+                                _be36.parse_args(["--onedir", "--console"]))
+check("--onedir / --console 换得掉",
+      "--onedir" in _cmd36b and "--console" in _cmd36b, _cmd36b)
+check("排除清单原样进了命令行",
+      _cmd36.count("--exclude-module") == len(_be36.EXCLUDES), _cmd36)
+check("unittest **不在**排除清单里 (加了它 sklearn 直接挂, 见 build_exe 里的说明)",
+      "unittest" not in _be36.EXCLUDES, _be36.EXCLUDES)
+
+# --- 36b) hook 本身: 该留的留, 该砍的砍 ---
+_hook36 = os.path.join(_be36.HOOKS_DIR, "hook-_tkinter.py")
+check("build_hooks/hook-_tkinter.py 还在 (它不在就悄悄退回自带 hook)",
+      os.path.isfile(_hook36), _hook36)
+if os.path.isfile(_hook36):
+    import importlib.util as _ilu36
+    _spec36 = _ilu36.spec_from_file_location("_hook36", _hook36)
+    _h36 = _ilu36.module_from_spec(_spec36)
+    _spec36.loader.exec_module(_h36)
+
+    check("Tcl 的 init.tcl 留着", _h36._wanted("_tcl_data\\init.tcl"))
+    check("Tcl 的 clock.tcl 留着", _h36._wanted("_tcl_data\\clock.tcl"))
+    check("编码表留着 (Tcl 读写非 UTF-8 文本要查它)",
+          _h36._wanted("_tcl_data\\encoding\\cp1252.enc"))
+    check("ttk 主题留着 (界面用的就是 clam)",
+          _h36._wanted("_tk_data\\ttk\\clamTheme.tcl"))
+    check("时区表砍掉", not _h36._wanted("_tcl_data\\tzdata\\Africa\\Abidjan"))
+    check("多语言消息砍掉", not _h36._wanted("_tcl_data\\msgs\\de.msg"))
+    check("Tk 的消息也砍掉", not _h36._wanted("_tk_data\\msgs\\de.msg"))
+    # 库目录下的一级文件 (没有第二段路径) 不能因为"取不到 parts[1]"被误砍
+    check("一级文件 (如 auto.tcl) 不受影响", _h36._wanted("_tcl_data\\auto.tcl"))
+
+    # 别只验上面那几个写死的例子 —— 对着**本机真的** Tcl/Tk 目录跑一遍筛选,
+    # 顺便把"到底省了多少个文件"钉在断言里。
+    try:
+        from PyInstaller.utils.hooks.tcl_tk import tcltk_info as _tcl36
+    except ImportError:
+        print("  (本机没装 PyInstaller, 跳过'对着真 Tcl/Tk 数一遍'那几条)")
+    else:
+        _all36 = _tcl36.data_files
+        _kept36 = [e for e in _all36 if _h36._wanted(e[0])]
+        _gone36 = [e for e in _all36 if not _h36._wanted(e[0])]
+        check("真的砍掉了不少 (对着本机 Tcl/Tk 数出来的)",
+              len(_gone36) >= 700, (len(_kept36), len(_gone36)))
+        check("留下来的比砍掉的少得多 (砍的正是大头)",
+              len(_kept36) < len(_gone36), (len(_kept36), len(_gone36)))
+        _wrong36 = [e[0] for e in _gone36
+                    if e[0].replace("\\", "/").split("/")[1:2] not in
+                    (["tzdata"], ["msgs"])]
+        check("砍掉的只有 tzdata / msgs, 没误伤别的", not _wrong36, _wrong36[:3])
+        _names36 = {e[0].replace("\\", "/") for e in _kept36}
+        check("init.tcl 真的在留下来的那批里",
+              any(n.endswith("_tcl_data/init.tcl") for n in _names36))
 
 print()
 print("=" * 70)
