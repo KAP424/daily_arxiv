@@ -78,7 +78,7 @@ class LibraryIndex:
         if not docs:
             return
         try:
-            from sklearn.feature_extraction.text import TfidfVectorizer
+            from .tfidf import TfidfVectorizer
             self._vectorizer = TfidfVectorizer(
                 stop_words="english", ngram_range=(1, 2),
                 sublinear_tf=True, min_df=1, max_features=60000,
@@ -96,7 +96,7 @@ class LibraryIndex:
             return self._keyword_related(cand, k)
 
         try:
-            from sklearn.metrics.pairwise import cosine_similarity
+            from .tfidf import cosine_similarity
             query = self._vectorizer.transform(
                 [strip_latex("%s %s" % (cand.title or "",
                                         cand.abstract or "")).lower()]
@@ -109,7 +109,12 @@ class LibraryIndex:
             return self._keyword_related(cand, k)
 
     def _keyword_related(self, cand: Candidate, k: int) -> List[LibraryPaper]:
-        """无 sklearn 时的兜底: 按标题/摘要的词重叠数排序。"""
+        """TF-IDF 建不起来时的兜底: 按标题/摘要的词重叠数排序。
+
+        ``_build`` / ``related`` 里那两处 ``try`` 只可能在 numpy 缺失或数据异常
+        时触发 (模块本身是包内的, 不会 import 不到), 但兜底还是留着 —— 没有它
+        就是整页推荐直接失败。
+        """
         target = set(strip_latex("%s %s" % (cand.title or "",
                                             cand.abstract or "")).lower().split())
         target = {t for t in target if len(t) >= 4}

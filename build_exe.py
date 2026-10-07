@@ -31,21 +31,22 @@ PyInstaller 单文件模式启动时会先把内容解到临时目录, 所以 ``
 
 单文件 vs 文件夹
 --------------------------------------------------------------------------
-单文件就是一个 exe, 好拷贝, 但每次启动都要解包 (numpy + sklearn + PyMuPDF
+单文件就是一个 exe, 好拷贝, 但每次启动都要解包 (numpy + PyMuPDF
 加起来不小), 首次启动大概几秒。``--onedir`` 出的是一整个文件夹, 启动快,
 适合长期放在自己机器上用。默认给单文件, 因为"一个能双击的 exe"最省事。
 
 体积: 用 ``--venv`` 能让 exe 小一大截
 --------------------------------------------------------------------------
 当前解释器是 conda 环境时, 打出来的 exe 会非常大 (700 MB 量级), 几乎全部
-是 ``mkl_*.dll``: conda 的 numpy / scipy 链的是 Intel MKL, 而 MKL 要为每一代
+是 ``mkl_*.dll``: conda 的 numpy 链的是 Intel MKL, 而 MKL 要为每一代
 CPU 各带一套内核 (avx512 / avx2 / avx / mc / ...), 加起来 600 MB 上下。
 
     python build_exe.py --venv
 
 会建一个只装了运行依赖的干净虚拟环境, 用 PyPI 的 wheel (链的是 OpenBLAS,
-一个 30 MB 的 dll) 来打包, exe 通常能降到 200 MB 以内。本程序只做 TF-IDF
-和余弦相似度, 这点矩阵运算用哪个 BLAS 毫无区别。
+一个 36 MB 的 dll) 来打包。现在 scipy / sklearn 已经不在依赖里了, 走这条路
+打出来的是 **38 MB**。本程序只做 TF-IDF 和余弦相似度, 这点矩阵运算用哪个
+BLAS 毫无区别。
 
 **不要**手工去删那些 mkl_*.dll: MKL 靠它们适配 CPU, 删掉在你机器上能跑,
 换台机器就会 "DLL load failed"。要么留着, 要么用 ``--venv`` 从根上换掉。
@@ -88,25 +89,34 @@ HOOKS_DIR = os.path.join(ROOT, "build_hooks")
 # 这些包在这台机器上装着, 但本程序一行都没用到。不排除的话 PyInstaller 有
 # 可能顺着某个间接引用把它们整包拖进来 —— 光 matplotlib + pandas 就是上百 MB。
 #
-# **不要**把 unittest 加进来。曾经加过, 结果是打出来的 exe 里 sklearn 直接
-# 报 "No module named 'unittest'" —— sklearn 内部有模块 import unittest。
+# **不要**把 unittest 加进来。曾经加过, 结果是打出来的 exe 里 sklearn (那时还
+# 在用) 直接报 "No module named 'unittest'" —— 它内部有模块 import unittest。
 # 而 sklearn 一挂, 相关性排序就退化成关键词重叠 (rank.py 里给所有候选 0.5 分),
 # 推荐质量掉一大截, 而且**表面上一切正常**, 不报错, 只是结果变差。
+# sklearn 现在不用了, 但这条规矩照旧: numpy 的 testing 模块也 import unittest,
 # 排除清单里每一条都要确认"真的没人 import", 这类标准库尤其危险。
 EXCLUDES = [
     "matplotlib", "pandas", "PIL", "IPython", "notebook", "jupyter",
     "pytest", "tornado", "zmq", "PyQt5", "PyQt6", "PySide2", "PySide6",
     "wx",
     # 这些是明确的测试包, 运行时不会被 import
-    "tkinter.test", "sklearn.tests", "scipy.tests", "numpy.tests",
+    "tkinter.test", "numpy.tests",
+    # 本程序已经不用 scipy / sklearn 了 (TF-IDF 和余弦在 arxiv_rec/tfidf.py 里
+    # 用 numpy 自己实现, 见那里的说明)。构建环境里万一还留着, 也别让
+    # PyInstaller 顺藤摸瓜拖进来 —— 这两个包合起来是上一版 exe 里 34 MB 的压缩
+    # 体积 (解包后 100 MB)。
+    "sklearn", "scipy",
 ]
 
-# 就这些了 —— **别再往下加**。实测一条 ``import sklearn.feature_extraction.text``
-# 就把 433 个 scipy 子模块 (含 scipy.linalg, 它链着 scipy 自己那份 OpenBLAS)、
-# asyncio、pydoc、multiprocessing、unittest、difflib 全拖进内存 —— scipy /
-# sklearn / numpy 的 import 链密到"看着没用"的模块其实都在路上。剩下那些真的
-# 没人 import 的 (pdb + doctest + tarfile + optparse) 加起来 95 KB, 占 exe 的
-# 0.12%, 换不来一次静默降级的风险 (见上面 unittest 那一段)。
+# 就这些了 —— **别再往下加**。实测一条 ``import numpy`` 就把 asyncio、pydoc、
+# multiprocessing、unittest、difflib 全拖进内存 —— numpy 的 import 链密到
+# "看着没用"的模块其实都在路上。剩下那些真的没人 import 的 (pdb + doctest +
+# tarfile + optparse) 加起来 95 KB, 占 exe 的 0.12%, 换不来一次静默降级的风险
+# (见上面 unittest 那一段)。
+#
+# 以前 scipy / sklearn 才是重灾区: 一条 ``import sklearn.feature_extraction.text``
+# 能拖进 433 个 scipy 子模块 (含 scipy.linalg, 它链着 scipy 自己那份 OpenBLAS)。
+# 现在这两包整个不打了 —— 这版 exe 比上一版小多少, 见 release/notes.md。
 
 
 def log(msg: str) -> None:
@@ -171,7 +181,7 @@ def parse_args(argv=None) -> argparse.Namespace:
 
 
 def _looks_like_conda() -> bool:
-    """当前解释器是不是 conda 环境 (它的 numpy/scipy 链的是 Intel MKL)。"""
+    """当前解释器是不是 conda 环境 (它的 numpy 链的是 Intel MKL)。"""
     if os.environ.get("CONDA_PREFIX"):
         return True
     exe = (sys.executable or "").replace("\\", "/").lower()
@@ -194,7 +204,7 @@ def warn_bloated_build(packer: str) -> None:
     log("提示: 现在用的是 conda 环境里的解释器:")
     log("    %s" % packer)
     log("")
-    log("conda 的 numpy/scipy 链的是 Intel MKL, 打出来的 exe 会大 3 倍多")
+    log("conda 的 numpy 链的是 Intel MKL, 打出来的 exe 会大 3 倍多")
     log("(实测 283 MB, 而 --venv 出来是 74 MB)。功能没有任何区别。")
     log("")
     log("想要小体积, 加一个 --venv:")
@@ -227,7 +237,7 @@ def ensure_venv(venv_dir: str, proxy: str, refresh: bool) -> str:
 
     为什么值得多这一步
     ------------------------------------------------------------------
-    conda 环境里的 numpy / scipy 链的是 Intel MKL, 光 ``mkl_*.dll`` 就有
+    conda 环境里的 numpy 链的是 Intel MKL, 光 ``mkl_*.dll`` 就有
     600 MB 上下 (它要为每代 CPU 都带一套内核), 打出来的 exe 会到 700 MB+。
     PyPI 上的 wheel 用的是 OpenBLAS, 一个 30 MB 左右的 dll 搞定 ——
     功能上对本程序 (TF-IDF + 余弦相似度, 这点矩阵运算) 没有任何区别,
@@ -248,12 +258,12 @@ def ensure_venv(venv_dir: str, proxy: str, refresh: bool) -> str:
     else:
         log("复用已有的构建环境: %s" % venv_dir)
 
+    # 只有这四个。TF-IDF / 余弦相似度是 arxiv_rec/tfidf.py 自己拿 numpy 实现的,
+    # 不再需要 scipy 和 scikit-learn —— 它们曾经占了 exe 里 34 MB 的压缩体积。
     pkgs = [
         "requests>=2.25",
         "PyMuPDF>=1.23",
         "numpy>=1.19",
-        "scipy>=1.5",            # sklearn 依赖
-        "scikit-learn>=0.24",
         "pyinstaller>=6.0,<6.12",
     ]
     cmd = [py, "-m", "pip", "install", "--disable-pip-version-check",
@@ -434,9 +444,9 @@ def pyinstaller_cmd(packer: str, dist: str, build: str,
            "--onedir" if args.onedir else "--onefile",
            "--console" if args.console else "--windowed",
            # 收集进来的字节码去掉 docstring 和 assert: PYZ 小 33% (7.29 → 4.9 MB)。
-           # 已经单独打过一个 -OO 的探针 exe 验证过依赖全都活着 (sklearn 的
-           # TF-IDF + 余弦、numpy/scipy、PyMuPDF 开真 PDF、本程序自己的
-           # pdf_library.read_pdf_library), 见模块开头那段说明。
+           # 已经单独打过一个 -OO 的探针 exe 验证过依赖全都活着 (TF-IDF + 余弦、
+           # numpy、PyMuPDF 开真 PDF、本程序自己的 pdf_library.read_pdf_library),
+           # 见模块开头那段说明。
            "--optimize", "2",
            # 显式关掉 UPX: 它省体积但拖慢启动, 见模块开头。
            "--noupx",

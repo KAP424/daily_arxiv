@@ -185,13 +185,15 @@ def _self_check(config_path: Optional[str]) -> int:
             ("requests", "联网抓 arXiv", "req"),
             ("fitz", "解析 PDF (PyMuPDF)", "req"),
             ("numpy", "数值计算", "warn"),
-            ("sklearn", "TF-IDF 相关性", "warn")):
+            ("arxiv_rec.tfidf", "TF-IDF 相关性", "warn")):
         try:
             __import__(mod)
-            w("  [OK ] %-9s %s" % (mod, why))
+            # 宽度按最长那个模块名 (arxiv_rec.tfidf, 15 字符) 定 —— 窄了的话
+            # 它会把后面的说明文字挤在一起, 报告看着像坏了
+            w("  [OK ] %-16s %s" % (mod, why))
         except Exception as exc:
             mark = {"req": "!!", "warn": "~~", "opt": "--"}[level]
-            w("  [%s] %-9s %s  (%s)" % (mark, mod, why, exc))
+            w("  [%s] %-16s %s  (%s)" % (mark, mod, why, exc))
             if level == "req":
                 ok = False
             elif level == "warn":
@@ -202,7 +204,7 @@ def _self_check(config_path: Optional[str]) -> int:
         w("注意 (能跑, 但结果会变差):")
         for msg in warnings:
             w("  - %s" % msg)
-        w("  sklearn 不可用时, 相关性排序会退化成关键词重叠, 分数普遍挤在一起;")
+        w("  TF-IDF 不可用时, 相关性排序会退化成关键词重叠, 分数普遍挤在一起;")
         w("  这种情况通常是打包时把某个模块排除掉了, 用 --venv 重新打包试试。")
         w("")
     w("=" * 66)

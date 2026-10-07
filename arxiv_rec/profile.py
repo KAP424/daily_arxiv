@@ -190,7 +190,7 @@ each other others into out up down about which who whom whose what when where wh
 
 def _heuristic_profile(papers: List[LibraryPaper], n_queries: int) -> Dict[str, Any]:
     """无 AI 时: 用 TF-IDF 从标题+摘要里抽关键词, 拼成检索式。"""
-    from sklearn.feature_extraction.text import TfidfVectorizer
+    from .tfidf import TfidfVectorizer
 
     docs = []
     for p in papers:

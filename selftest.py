@@ -2983,12 +2983,21 @@ try:
             if _locked34(_lock34):
                 break
             _time.sleep(0.25)
-        check("被占着的目录: 报出原因而不是静默", bool(_be34._remove_dir_safely(_lock34)))
-        check("被占着的目录: 目录还在", os.path.isdir(_lock34))
-        check("被占着的目录: 里面的文件一个都没少",
-              os.path.isfile(os.path.join(_lock34, "keep.txt")))
-        check("被占着的目录: 没留下半拉子的 .delete_me",
-              not os.path.isdir(_lock34 + ".delete_me"))
+        # 锁没等来就**别往下测**: 下面三条是在"目录确实被占着"这个前提上做的断言,
+        # 前提不成立时它们会一起报错, 而报出来的三句话("没报出原因"/"目录还在")
+        # 完全指向不了真正的原因 —— 只会让人以为是 _remove_dir_safely 坏了。
+        # (实测踩过一次: 机器正忙着别的活, 子进程的目录锁迟迟没生效。)
+        if not _locked34(_lock34):
+            print("  --   子进程没能占住目录 (机器太忙?), 跳过这 4 条")
+            print("       (这不是 _remove_dir_safely 的问题, 重跑一遍通常就好)")
+        else:
+            check("被占着的目录: 报出原因而不是静默",
+                  bool(_be34._remove_dir_safely(_lock34)))
+            check("被占着的目录: 目录还在", os.path.isdir(_lock34))
+            check("被占着的目录: 里面的文件一个都没少",
+                  os.path.isfile(os.path.join(_lock34, "keep.txt")))
+            check("被占着的目录: 没留下半拉子的 .delete_me",
+                  not os.path.isdir(_lock34 + ".delete_me"))
     finally:
         _p34.kill()
         _p34.wait()
@@ -3289,8 +3298,12 @@ check("--onedir / --console 换得掉",
       "--onedir" in _cmd36b and "--console" in _cmd36b, _cmd36b)
 check("排除清单原样进了命令行",
       _cmd36.count("--exclude-module") == len(_be36.EXCLUDES), _cmd36)
-check("unittest **不在**排除清单里 (加了它 sklearn 直接挂, 见 build_exe 里的说明)",
+check("unittest **不在**排除清单里 (当年加了它 sklearn 直接挂, 见 build_exe 的说明)",
       "unittest" not in _be36.EXCLUDES, _be36.EXCLUDES)
+# 这两个必须**在**排除清单里: 本程序已经不用它们了 (见 selftest 第 37 节),
+# 而构建环境里万一还装着, 不排除就会被 PyInstaller 拖进来 —— 34 MB。
+check("sklearn / scipy 在排除清单里 (不用了, 别让 PyInstaller 拖进来)",
+      "sklearn" in _be36.EXCLUDES and "scipy" in _be36.EXCLUDES, _be36.EXCLUDES)
 
 # --- 36b) hook 本身: 该留的留, 该砍的砍 ---
 _hook36 = os.path.join(_be36.HOOKS_DIR, "hook-_tkinter.py")
@@ -3335,6 +3348,215 @@ if os.path.isfile(_hook36):
         _names36 = {e[0].replace("\\", "/") for e in _kept36}
         check("init.tcl 真的在留下来的那批里",
               any(n.endswith("_tcl_data/init.tcl") for n in _names36))
+
+print()
+print("=" * 70)
+print("37) TF-IDF: 自己拿 numpy 写的实现 (顶掉 sklearn + scipy)")
+print("=" * 70)
+# 这一节盯 arxiv_rec/tfidf.py —— 相关性排序 (rank.py)、相关文献预筛 (analyze.py)、
+# 关键词抽取 (profile.py) 全走它。两个地方最容易悄悄坏掉:
+#
+#   1. **空行**。剪枝之后整篇文档一个词都不剩是常事 (min_df=2 时就有), 它的行必须
+#      全零、和谁的相似度都是 0。numpy 的 reduceat 碰到"起止下标相等"会返回那一个
+#      元素而不是 0; 想绕开它又很容易把**上一行**的累加范围截断。这个坑真踩过:
+#      一篇空文档让它上一篇的分数涨了 20 倍, 而且一声不吭 —— 所以下面那条"非空行
+#      的 L2 范数必须是 1"是这一节的命根子。
+#   2. **和 sklearn 的数值对不对得上**。装了就逐项对拍 (词表 / 每个数 / 余弦 /
+#      排序 / transform), 没装就只跑结构断言 —— 打包出来的 exe 里没有 sklearn,
+#      这一节不能因此变红。
+import numpy as _np37
+from arxiv_rec import tfidf as _tf37
+
+_docs37 = [
+    "quantum spin liquid entanglement entropy",
+    "quantum spin liquid and entanglement",
+    "quantum monte carlo simulation of the hubbard model",
+    "hubbard model sign problem quantum monte carlo",
+    "uniqueterm onlyhere",                        # min_df=2 之后整篇都没了 -> 空行
+    "quantum spin liquid entanglement entropy",   # 和第 1 篇一字不差
+]
+_kw37 = dict(stop_words="english", ngram_range=(1, 2), sublinear_tf=True, min_df=2)
+_v37 = _tf37.TfidfVectorizer(**_kw37)
+_M37 = _v37.fit_transform(_docs37)
+_names37 = list(_v37.get_feature_names_out())
+_d37 = _M37.toarray()
+
+# --- 37a) 结构断言 (不需要 sklearn) ---
+check("剪枝砍掉了只出现一次的词 (uniqueterm / onlyhere 都不在词表里)",
+      "uniqueterm" not in _names37 and "onlyhere" not in _names37, _names37)
+check("该留的词留着了 (quantum / spin / liquid / monte 都在)",
+      all(w in _names37 for w in ("quantum", "spin", "liquid", "monte")), _names37[:8])
+check("词表是字母序的", _names37 == sorted(_names37), _names37[:6])
+check("vocabulary_ 的下标和 get_feature_names_out 对得上",
+      all(_v37.vocabulary_[n] == i for i, n in enumerate(_names37)))
+_emp37 = [i for i in range(6) if not _d37[i].any()]
+check("剪枝之后有且只有一行全零 (第 5 篇)", _emp37 == [4], _emp37)
+_n37 = _np37.sqrt((_d37 ** 2).sum(axis=1))
+check("非空行的 L2 范数都是 1 (上一篇被空行带坏的话这条立刻炸)",
+      all(abs(_n37[i] - 1.0) < 1e-12 for i in range(6) if i != 4),
+      [round(float(x), 6) for x in _n37])
+_C37 = _tf37.cosine_similarity(_M37)
+check("空行和谁的相似度都是 0 (横竖两个方向)",
+      float(abs(_C37[4]).max()) < 1e-15 and float(abs(_C37[:, 4]).max()) < 1e-15,
+      _C37[4])
+check("一字不差的两篇 -> 相似度正好是 1", abs(_C37[0][5] - 1.0) < 1e-15, _C37[0][5])
+check("非空行自己对自己是 1",
+      all(abs(_C37[i][i] - 1.0) < 1e-15 for i in range(6) if i != 4))
+check("相似度都在 0~1 之间, 而且左右对称",
+      float(_C37.min()) >= -1e-15 and float(_C37.max()) <= 1 + 1e-15
+      and float(abs(_C37 - _C37.T).max()) < 1e-15,
+      (float(_C37.min()), float(_C37.max())))
+_q37 = _v37.transform(["quantum spin liquid brandnewword"])
+check("transform: 词表外的词丢掉, 词表内的 5 个 (3 单词 + 2 双词) 留着",
+      _q37.data.size == 5, _q37.data.size)
+check("transform 出来的行范数也是 1",
+      abs(float(_np37.sqrt((_q37.toarray() ** 2).sum())) - 1.0) < 1e-12)
+try:
+    _tf37.TfidfVectorizer(stop_words="english").fit_transform(["the a of", "of the a"])
+    _raised37 = False
+except ValueError:
+    _raised37 = True
+check("整批文档全是停用词时抛 ValueError (不能返回一张空词表硬撑着)", _raised37)
+
+# --- 37a2) 换了实现之后, 别再有人偷偷 import 回去 ---
+# 这一条是这次改动的命门。打包出来的 exe 里**没有** sklearn / scipy 了
+# (build_exe.py 的 EXCLUDES 把它们排掉, 依赖清单里也删了)。要是哪天 arxiv_rec/
+# 里又冒出一句 ``from sklearn... import ...``, 程序**不会报错** —— 那三处调用点
+# 全是 try/except 兜底的, 它会安安静静退化成关键词重叠, 推荐质量掉一大截,
+# 而你只会在某天觉得"最近推荐怎么不太准"。所以直接扫源码。
+# 只认真的 import 语句 (行首 from/import), 注释和 docstring 里提到 sklearn 不算。
+import re as _re37
+_ar37 = os.path.join(os.path.dirname(os.path.abspath(__file__)), "arxiv_rec")
+_imp37 = _re37.compile(r"^\s*(?:from|import)\s+(sklearn|scipy)(?:\.[\w.]*)?\s*(?:import\s|$)")
+_hit37 = []
+for _fn37 in sorted(os.listdir(_ar37)):
+    if not _fn37.endswith(".py"):
+        continue
+    with open(os.path.join(_ar37, _fn37), encoding="utf-8") as _f37:
+        for _ln37, _line37 in enumerate(_f37, 1):
+            _m37 = _imp37.match(_line37)
+            if _m37:
+                _hit37.append("arxiv_rec/%s:%d %s" % (_fn37, _ln37, _line37.strip()))
+check("arxiv_rec/ 里没有一句 import sklearn / scipy (有的话 exe 里就是 ImportError, "
+      "而三处调用点全是 try/except 兜底 —— 会静默退化成关键词匹配)", not _hit37, _hit37)
+
+# --- 37b) 和 sklearn 逐项对拍 (装了才跑) ---
+try:
+    from sklearn.feature_extraction.text import TfidfVectorizer as _Sk37
+    from sklearn.metrics.pairwise import cosine_similarity as _skcos37
+except Exception as _e37:
+    print("  (没装 sklearn, 跳过'和 sklearn 逐项对拍'那几条: %s)" % _e37)
+else:
+    # 对拍口径: 结构必须**完全一样** (词表逐字、非零元个数), 数值允许 ~1e-12 的
+    # 相对误差 —— 行范数 sklearn 用 Cython 顺序累加, 我们走 numpy 的 reduceat
+    # (成对累加), 尾数差几个 ulp 是躲不掉的 (实测真实文献库 2.4e-16, 最坏的
+    # 人造语料 7.5e-15)。真正要钉死的是**排序**不能变。
+    _edge37 = ["", "   ", "the a of", "real words here and there"]
+
+    def _cmp37(tag, docs, **kw):
+        try:
+            sv = _Sk37(**kw)
+            Xs = sv.fit_transform(docs)
+            sk_err = None
+        except Exception as exc:
+            sv = Xs = None
+            sk_err = exc
+        try:
+            mv = _tf37.TfidfVectorizer(**kw)
+            Xm = mv.fit_transform(docs)
+            me_err = None
+        except Exception as exc:
+            mv = Xm = None
+            me_err = exc
+        if sk_err is not None or me_err is not None:
+            check("%s: 报错行为一致" % tag, (sk_err is None) == (me_err is None),
+                  "sklearn=%r 我们=%r" % (sk_err, me_err))
+            return
+        ns = [str(x) for x in sv.get_feature_names_out()]
+        nm = [str(x) for x in mv.get_feature_names_out()]
+        if ns != nm:
+            check("%s: 词表逐字一样" % tag, False,
+                  "%d vs %d 个词: %s vs %s" % (len(ns), len(nm), ns[:4], nm[:4]))
+            return
+        check("%s: 词表逐字一样 (%d 个词)" % (tag, len(ns)), True)
+        check("%s: 非零元个数一样" % tag, Xs.nnz == Xm.data.size,
+              (Xs.nnz, Xm.data.size))
+        a, b = Xs.toarray(), Xm.toarray()
+        _sc = max(1e-300, float(abs(a).max()), float(abs(b).max()))
+        _r = float(abs(a - b).max()) / _sc
+        check("%s: 每个数都对得上 (相对 %.1e)" % (tag, _r), _r <= 1e-12)
+        cs = _skcos37(Xs)
+        cm = _tf37.cosine_similarity(Xm)
+        _rc = float(abs(cs - cm).max()) / max(1e-300, float(abs(cs).max()))
+        check("%s: 余弦相似度对得上 (相对 %.1e)" % (tag, _rc), _rc <= 1e-12)
+        check("%s: 余弦每行的排序完全一致" % tag,
+              all((cs[i].argsort()[::-1] == cm[i].argsort()[::-1]).all()
+                  for i in range(cs.shape[0])))
+        _qq = "quantum spin liquid brandnewword"
+        _qs = sv.transform([_qq]).toarray()
+        _qm = mv.transform([_qq]).toarray()
+        _rq = float(abs(_qs - _qm).max()) / max(1e-300, float(abs(_qs).max()))
+        check("%s: transform 对得上 (相对 %.1e)" % (tag, _rq), _rq <= 1e-12)
+
+    _cmp37("小语料/min_df=1", _docs37,
+           stop_words="english", ngram_range=(1, 2), sublinear_tf=True, min_df=1)
+    _cmp37("小语料/min_df=2 (有空行)", _docs37, **_kw37)
+    _cmp37("小语料/单词 + max_features", _docs37,
+           stop_words="english", ngram_range=(1, 1), max_features=8)
+    _cmp37("空文档和停用词", _edge37,
+           stop_words="english", ngram_range=(1, 2), sublinear_tf=True, min_df=1)
+    _cmp37("空文档/只要双词", _edge37, ngram_range=(2, 2), min_df=1)
+
+    # 真实文献库: 有就拿前 80 篇再对一遍 (开发时 204 篇全量跑过, 结论一样)。
+    # 先复制一份再读 —— 绝不拿 PdfIndex 直接开用户那份索引, 它初始化时可能作废
+    # 记录, 一个自查程序不该有这种副作用。
+    _db37 = ""
+    try:
+        from arxiv_rec.config import data_paths as _dp37
+        _db37 = _dp37({"library": {"index_db": "library_index.sqlite"}})[0][2]
+    except Exception:
+        _db37 = ""
+    if not _db37 or not os.path.isfile(_db37):
+        print("  (没找到文献库索引, 跳过'拿真实文献对拍')")
+    else:
+        import shutil as _sh37, tempfile as _tmpmod37
+        from arxiv_rec.pdf_library import (PdfIndex as _PI37, _row_to_paper as _rtp37,
+                                           normalize_depth as _nd37)
+        _copy37 = os.path.join(_tmpmod37.gettempdir(), "daily_arxiv_selftest_tfidf.sqlite")
+        try:
+            _sh37.copy(_db37, _copy37)
+            _ix37 = _PI37(_copy37)
+            _ps37 = []
+            for _row in _ix37.rows():
+                if _row["status"] not in ("ok", "notext"):
+                    continue
+                try:
+                    _rtp37(_row, _row["path"], _ps37, _nd37("sections"))
+                except Exception:
+                    continue
+                if len(_ps37) >= 80:
+                    break
+            _ix37.close()
+            _real37 = []
+            for _p in _ps37:
+                _t = " ".join(x for x in (_p.title, _p.abstract, _p.context) if x)
+                if _t.strip():
+                    _real37.append(_t.lower())
+            check("从真实文献库里读到了文档 (前 %d 篇)" % len(_real37), len(_real37) >= 5,
+                  len(_real37))
+            if len(_real37) >= 5:
+                _cmp37("真实文献库前 80 篇", _real37, stop_words="english",
+                       ngram_range=(1, 2), sublinear_tf=True, min_df=1,
+                       max_features=60000)
+        except Exception as _exc37:
+            print("  (拿真实文献对拍时出错, 跳过: %r)" % _exc37)
+        finally:
+            for _suf in ("", "-wal", "-shm"):
+                if os.path.exists(_copy37 + _suf):
+                    try:
+                        os.remove(_copy37 + _suf)
+                    except OSError:
+                        pass
 
 print()
 print("=" * 70)

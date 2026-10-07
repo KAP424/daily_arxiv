@@ -110,10 +110,9 @@ def heuristic_relevance(
         return {c.arxiv_id: 0.5 for c in candidates}
 
     try:
-        from sklearn.feature_extraction.text import TfidfVectorizer
-        from sklearn.metrics.pairwise import cosine_similarity
+        from .tfidf import TfidfVectorizer, cosine_similarity
     except ImportError:
-        log("sklearn 不可用, 启发式相关性全部给 0.5", "warn")
+        log("TF-IDF 模块不可用, 启发式相关性全部给 0.5", "warn")
         return {c.arxiv_id: 0.5 for c in candidates}
 
     try:
