@@ -7,6 +7,6 @@
 文献来源只有本地 PDF 文件夹, 不读 Zotero 数据库。
 """
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 __all__ = ["__version__"]
