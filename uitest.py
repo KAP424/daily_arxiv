@@ -1172,6 +1172,7 @@ check("记录里每一条都是推荐过的, 不重复写'已推荐过'",
 
 # --- 和 AI 深入讨论 ---
 from arxiv_rec import chat as _chat6
+from arxiv_rec.ai import AIStopped
 
 _ai6 = {"client": None, "ensure": []}
 _orig_chat_ai = app._chat_ai
@@ -1208,29 +1209,79 @@ app._chat_papers_cache = lambda cfg: _papers6
 
 
 class _FakeChatAI:
-    """假 AI: 聊天给一段文字, 重写详解给一份 JSON。不打网络。"""
+    """假 AI: 聊天给一段文字, 重写详解给一份 JSON。不打网络。
 
-    def __init__(self, fail=False):
+    聊天这一路会**真的吐 delta** (走 ``on_delta``), 并检查 ``stop_event`` ——
+    界面上的流式渲染、停止按钮都靠它驱动。要验"中途停止", 就让假 AI 在每个
+    delta 之间摸一下 stop_event, 置位了抛 AIStopped (和真实现一模一样)。
+    """
+
+    def __init__(self, fail=False, think="先想想这个问题。", n_delta=3,
+                 pre_wait=False):
         self.fail = fail
         self.calls = []
         self.answer = "它把符号问题转成了一个可解的本征值问题。"
+        self.think = think
+        self.n_delta = n_delta
+        # 测试用的闸门: 置成 True 之后, 假 AI 每吐一个 delta 就停在那儿等,
+        # 好让测试在主线程里从容地按"停止"、看界面。None = 不等, 一口气吐完。
+        self.gate = None
+        # 第一个 delta **之前**就等 —— 模拟"一个字都还没吐出来就按了停止"。
+        # 真的 _read_stream 也是每读一行先查一次 stop_event, 所以停止可以发生在
+        # 任何一段文字之前。
+        self.pre_wait = pre_wait
         self.data = {
             "summary": "按讨论重写的讲解。",
             "connections": [{"paper": "编出来的标签 2099", "relation": "编的"}],
             "ideas": "按讨论重写的新方向。",
         }
 
-    def chat(self, system, user, json_mode=False, use_cache=True):
+    def _wait(self, stop_event):
+        """闸门开着就停在这儿等, 期间盯着 stop_event (和真实现一样)。"""
+        _t0 = time.time()
+        while self.gate is not None and time.time() - _t0 < 5.0:
+            if stop_event is not None and stop_event.is_set():
+                raise AIStopped("假的: 已停止")
+            time.sleep(0.02)
+
+    def _emit(self, on_delta, stop_event, kind, piece):
+        if stop_event is not None and stop_event.is_set():
+            raise AIStopped("假的: 已停止")
+        if on_delta is not None:
+            on_delta(kind, piece, 0.5)
+        self._wait(stop_event)
+
+    def chat(self, system, user, json_mode=False, use_cache=True,
+             on_delta=None, stop_event=None):
         self.calls.append(("chat", system, user))
         if self.fail:
             raise RuntimeError("假的: 接口挂了")
+        if on_delta is None and stop_event is None:
+            return self.answer
+        if self.pre_wait:
+            self._wait(stop_event)
+        if self.think:
+            for piece in _split(self.think, self.n_delta):
+                self._emit(on_delta, stop_event, "thinking", piece)
+        for piece in _split(self.answer, self.n_delta):
+            self._emit(on_delta, stop_event, "answer", piece)
         return self.answer
 
-    def chat_json(self, system, user, default=None, use_cache=True):
+    def chat_json(self, system, user, default=None, use_cache=True,
+                  stop_event=None):
         self.calls.append(("json", system, user))
         if self.fail:
             raise RuntimeError("假的: 接口挂了")
         return self.data
+
+
+def _split(text, n):
+    """把一段话切成 n 片, 模拟流式增量。"""
+    if n <= 1:
+        return [text]
+    step = max(1, len(text) // n)
+    out = [text[i:i + step] for i in range(0, len(text), step)]
+    return out or [text]
 
 
 def _pump(cond, secs=20.0):
@@ -1426,6 +1477,166 @@ try:
           _lc6(app.cfg, _aid6) == [])
     check("清讨论**不动**推荐记录 (详解还在)",
           {r["arxiv_id"]: r for r in _lrows6(app.cfg)}[_aid6]["summary"] == "按讨论重写的讲解。")
+
+    # --- 流式: 思考灰字实时出现, 正文一开始就收成一行 ---
+    app.tree.selection_set("1")
+    app._on_select_candidate()
+    app.update()
+    app._chat_msgs = []
+    app._render_chat()
+    _gate6 = _FakeChatAI(think="先想符号问题, 再想怎么绕。", n_delta=3)
+    _gate6.gate = True          # 让它在每个 delta 之间停住, 好让主线程从容观察
+    _ai6["client"] = _gate6
+    app.var_chat_in.set("流式看看")
+    app.send_chat()
+    # 闸门开着, 假 AI 吐完第一片就停住了 —— 这时候界面上应该已经有思考灰字
+    check("等回复时停止按钮可点", _pump(
+        lambda: str(app.btn_chat_stop.cget("state")) == "normal"), "超时")
+    check("忙的时候停止按钮是实心红 (Stop.TButton)",
+          str(app.btn_chat_stop.cget("style")) == "Stop.TButton",
+          app.btn_chat_stop.cget("style"))
+    check("忙的时候撤回按钮置灰 (记录正被后台线程拿在手里)",
+          str(app.btn_chat_undo.cget("state")) == "disabled",
+          app.btn_chat_undo.cget("state"))
+    check("思考过程实时出现在对话区里",
+          _pump(lambda: "先想符号问题" in app.txt_chat.get("1.0", "end")), "超时")
+    _mid6 = app.txt_chat.get("1.0", "end")
+    check("思考那段现在还是**全文**, 没收起来",
+          "（思考了" not in _mid6, _mid6[-200:])
+
+    # --- 停止: 一个字都还没吐出来 (思考期间就停) ---
+    # 真的 _read_stream 每读一行先查一次 stop_event, 所以停止可以发生在任何一段
+    # 文字之前 —— 那种情况下一个字都没生成, 不该往库里塞一条空的 assistant。
+    app.stop_chat()
+    check("点了停止按钮立刻变'停止中'",
+          "停止中" in str(app.btn_chat_stop.cget("text")),
+          app.btn_chat_stop.cget("text"))
+    check("点了停止按钮自己置灰 (防连点)",
+          str(app.btn_chat_stop.cget("state")) == "disabled",
+          app.btn_chat_stop.cget("state"))
+    _gate6.gate = False
+    check("停下来了", _pump(lambda: app._chat_busy_aid == ""), "超时")
+    check("停下之后停止按钮恢复成灰色描边且不可点",
+          str(app.btn_chat_stop.cget("state")) == "disabled"
+          and str(app.btn_chat_stop.cget("style")) == "CardQuiet.TButton",
+          (app.btn_chat_stop.cget("state"), app.btn_chat_stop.cget("style")))
+    check("停下之后发送按钮恢复可点",
+          str(app.btn_chat_send.cget("state")) == "normal",
+          app.btn_chat_send.cget("state"))
+    check("一个字都没生成时不落库 (落一条空 assistant 下次会白发给 AI)",
+          [m["content"] for m in _lc6(app.cfg, _aid6)] == ["流式看看"],
+          _lc6(app.cfg, _aid6))
+    check("但对话区里留了一行'已停止'",
+          "已停止" in app.txt_chat.get("1.0", "end"),
+          app.txt_chat.get("1.0", "end")[-200:])
+    check("停止**不是**失败: 没有写'没答上来'",
+          not any("没答上来" in m["content"] for m in _lc6(app.cfg, _aid6)))
+
+    # --- 停止: 正文已经开始吐了 ---
+    # 这次不要思考 (think=""), 第一片就是正文, 所以停的时候已经有大半截了。
+    _part6 = _FakeChatAI(think="", n_delta=4)
+    _part6.gate = True
+    _ai6["client"] = _part6
+    app.var_chat_in.set("再来一次")
+    app.send_chat()
+    check("(前置) 又开始忙了", _pump(
+        lambda: str(app.btn_chat_stop.cget("state")) == "normal"), "超时")
+    check("正文开始往外吐了", _pump(
+        lambda: "它把符号问题转成" in app.txt_chat.get("1.0", "end")), "超时")
+    app.stop_chat()
+    _part6.gate = False
+    check("又停下来了", _pump(lambda: app._chat_busy_aid == ""), "超时")
+    _stop6 = app.txt_chat.get("1.0", "end")
+    check("停下之后半截正文留在对话区里 (那是真答出来的内容)",
+          "它把符号问题转成" in _stop6, _stop6[-300:])
+    _after_stop6 = _lc6(app.cfg, _aid6)
+    check("停下之后库里多出一条带说明的 assistant",
+          _after_stop6[-1]["role"] == "assistant"
+          and "没有写完" in _after_stop6[-1]["content"],
+          _after_stop6[-1] if _after_stop6 else None)
+    check("半截正文也存进去了 (不是只存了那句说明)",
+          "它把符号问题转成" in _after_stop6[-1]["content"],
+          _after_stop6[-1]["content"][:120])
+
+    # --- 撤回上一问 ---
+    # 先清干净: 前面那几次停止往这篇的讨论里留了东西, 不清的话"撤回"会先退掉
+    # 那些残留, 后面几条断言就全错位了。
+    from arxiv_rec.history import clear_chat as _cc6
+    _cc6(app.cfg, _aid6)
+    app._chat_msgs = []
+    app._render_chat()
+    _ai6["client"] = _FakeChatAI()
+    app.tree.selection_set("1")
+    app._on_select_candidate()
+    app.update()
+    _dlg["info"] = 0
+    app.undo_chat()
+    check("没问过就点撤回: 提示一句, 不炸", _dlg["info"] == 1, _dlg["info"])
+    check("没问过就点撤回不会往库里写东西", _lc6(app.cfg, _aid6) == [],
+          _lc6(app.cfg, _aid6))
+
+    app.var_chat_in.set("第一问")
+    app.send_chat()
+    check("第一问答完", _pump(lambda: app._chat_busy_aid == ""), "超时")
+    app.var_chat_in.set("第二问")
+    app.send_chat()
+    check("第二问答完", _pump(lambda: app._chat_busy_aid == ""), "超时")
+    _n6_before = len(_lc6(app.cfg, _aid6))
+    _dlg["ask"] = 0
+    app.undo_chat()
+    check("撤回**不弹确认框** (撤掉的话回到输入框, 本身可逆)",
+          _dlg["ask"] == 0, _dlg["ask"])
+    check("撤回的那句话回到输入框了", app.var_chat_in.get() == "第二问",
+          app.var_chat_in.get())
+    _n6_after = len(_lc6(app.cfg, _aid6))
+    check("库里少了两条 (第二问 + 它的回答)",
+          _n6_before - _n6_after == 2, (_n6_before, _n6_after))
+    _left6 = [m["content"] for m in _lc6(app.cfg, _aid6)]
+    check("第一问一答原样还在", "第一问" in _left6 and "第二问" not in _left6,
+          _left6)
+    check("对话区里也少了两条", "第二问" not in app.txt_chat.get("1.0", "end"),
+          app.txt_chat.get("1.0", "end")[-200:])
+
+    # 撤回之后改几个字重发: 这就是这个功能存在的意义
+    app.var_chat_in.set("第二问 (改过)")
+    app.send_chat()
+    check("改完能重发", _pump(lambda: app._chat_busy_aid == ""), "超时")
+    check("重发的那句进了库",
+          any(m["content"] == "第二问 (改过)" for m in _lc6(app.cfg, _aid6)),
+          [m["content"] for m in _lc6(app.cfg, _aid6)])
+
+    # --- 档位下拉: 两个页面共用一个变量 ---
+    check("推荐页有思考程度下拉", hasattr(app, "cmb_chat_effort"))
+    check("设置页也有思考程度下拉", hasattr(app, "cmb_effort"))
+    _labels6 = list(app.cmb_chat_effort.cget("values"))
+    check("下拉里是五档", len(_labels6) == 5, _labels6)
+    check("默认那档排在最前 (默认行为不变)", _labels6[0] == app.var_effort.get(),
+          (_labels6[0], app.var_effort.get()))
+    check("两个下拉共用同一个变量 (改一处两处一起变)",
+          str(app.cmb_effort.cget("textvariable")) == str(app.var_effort)
+          or app.cmb_effort.cget("textvariable") == str(app.var_effort),
+          (app.cmb_effort.cget("textvariable"), str(app.var_effort)))
+
+    # 在推荐页选"高", 设置页那边应该跟着显示"高"
+    from arxiv_rec.ai import EFFORT_LABELS as _EL6, effort_value as _ev6
+    app.var_effort.set(_EL6["high"])
+    app._on_effort_changed()
+    app.update()
+    check("选了'高'之后两个下拉显示的都是'高'",
+          app.cmb_chat_effort.get() == _EL6["high"]
+          and app.cmb_effort.get() == _EL6["high"],
+          (app.cmb_chat_effort.get(), app.cmb_effort.get()))
+    check("档位存进配置的是**值**不是中文名",
+          _ev6(app.var_effort.get()) == "high", _ev6(app.var_effort.get()))
+    app._collect_into_cfg()
+    check("_collect_into_cfg 把档位写进了 cfg.ai",
+          app.cfg["ai"].get("reasoning_effort") == "high",
+          app.cfg["ai"].get("reasoning_effort"))
+    check("选档位会标脏 (不标的话用户以为生效了其实没存)",
+          app.dirty, app.dirty)
+    # 收尾: 还原成默认, 别影响后面几节
+    app.var_effort.set(_EL6[""])
+    app._collect_into_cfg()
 
     # --- 没选论文就发 ---
     app._show_detail(None)

@@ -148,7 +148,8 @@ def transcript_text(msgs: List[Dict[str, Any]],
 # 两个入口
 # --------------------------------------------------------------------------
 def reply(ai: Any, prefix: str, msgs: List[Dict[str, Any]],
-          question: str) -> str:
+          question: str, on_delta: Any = None,
+          stop_event: Any = None) -> str:
     """回答一句追问。``msgs`` 是**这之前**的讨论 (不含这一问)。
 
     刻意不走 AI 缓存 (``use_cache=False``): 缓存按提示词逐字做键, 而这里每问
@@ -162,12 +163,15 @@ def reply(ai: Any, prefix: str, msgs: List[Dict[str, Any]],
     parts.append("研究者刚才问:\n%s" % str(question or "").strip())
     parts.append("请直接回答这个追问, 300-600 字。不要重复上面已经说过的内容; "
                  "如果这个问题论文里没有明确答案, 就说明你的推断和依据。")
-    text = ai.chat(CHAT_SYSTEM, "\n\n".join(parts), use_cache=False)
+    # ``on_delta`` / ``stop_event`` 原样透给 AI 客户端: 讨论这条路走流式, 界面
+    # 才能边出边显示、也才能中途掐掉 (见 ai.AIClient.chat)。
+    text = ai.chat(CHAT_SYSTEM, "\n\n".join(parts), use_cache=False,
+                   on_delta=on_delta, stop_event=stop_event)
     return (text or "").strip()
 
 
 def rewrite_analysis(ai: Any, prefix: str, msgs: List[Dict[str, Any]],
-                     labels: List[str]) -> Dict[str, Any]:
+                     labels: List[str], stop_event: Any = None) -> Dict[str, Any]:
     """把整场讨论整理成一份新的详解。返回 ``{summary, connections, ideas}``。"""
     hist = transcript_text(msgs)
     user = "\n\n".join([
@@ -177,7 +181,10 @@ def rewrite_analysis(ai: Any, prefix: str, msgs: List[Dict[str, Any]],
         "进来 (尤其是那些摘要里没有、聊出来才明确的细节); 关联要落到上面给出的"
         "文献标签上。严格按此 JSON 结构输出:\n%s" % ANALYZE_SCHEMA,
     ])
-    result = ai.chat_json(REWRITE_SYSTEM, user, default=None, use_cache=False)
+    # 这条路只透 ``stop_event``, 不透 ``on_delta``: 要的是一份 JSON, 流式显示
+    # 半截 JSON 看不出名堂; 但它同样可能想很久, 能停掉是有意义的。
+    result = ai.chat_json(REWRITE_SYSTEM, user, default=None, use_cache=False,
+                          stop_event=stop_event)
     return normalize_result(result, labels)
 
 

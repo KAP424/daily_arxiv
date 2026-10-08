@@ -50,6 +50,21 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "max_tokens": 4096,
         "timeout": 240,
         "max_retries": 3,
+        # 思考程度 (打分 / 深度解读 / 讨论都用它)。留空 = 什么都不发, 由服务端
+        # 按自己的默认来 —— 也就是这一项加进来之前的行为。
+        #   ""        不发, 服务端决定
+        #   "none"    不思考
+        #   "low" / "medium" / "high"
+        # 具体发什么由 ai.py 按 provider 翻译: OpenAI 兼容接口发
+        # reasoning_effort, Anthropic 发 thinking.budget_tokens。接口不认就
+        # 去掉这个参数重发一次 (日志里会说明), 所以填了也不会把请求搞坏。
+        # 注意: 它进了 AI 响应的磁盘缓存键, 所以改档位之后第一次跑推荐会重新
+        # 调用 AI —— 旧缓存是按旧档位生成的, 不能拿来用。
+        "reasoning_effort": "",
+        # 逃生口: 直接并进请求体的额外字段 (JSON 对象)。给"网关有自己一套字段"
+        # 的情况留的 —— 那种字段没法预先猜到, 写在这儿就不必改代码。
+        # 例: {"thinking": {"type": "enabled"}}
+        "extra_body": {},
     },
     "arxiv": {
         # 手动指定检索式; 留空则由 AI 根据你的文献库自动生成

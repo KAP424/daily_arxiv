@@ -25,6 +25,7 @@ import queue
 import re
 import sys
 import threading
+import time
 import traceback
 from typing import Any, Callable, Dict, List, Optional
 
@@ -32,6 +33,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 from . import past_runs, theme
+from .ai import (AIStopped, EFFORT_LABELS, EFFORT_LEVELS, effort_value)
 from .arxiv_search import CATEGORY_CHOICES
 from .config import load_config, project_root, resolve_path
 from .library import library_summary, load_library
@@ -46,6 +48,10 @@ from .utils import (add_log_sink, fmt_authors, fmt_date, fmt_journal,
                     reset_proxy_probe_cache, truncate)
 
 POLL_MS = 120
+# 流式回答重画的间隔 (毫秒)。每个 token 都重画会把主线程吃满, 而且人眼也跟
+# 不上 —— 100ms 一次看起来已经是"连续往外冒"了。POLL_MS 也是 120ms, 所以实际
+# 上限本来就由轮询周期定, 这个值主要是防"一轮轮询里挤了很多个 delta"。
+CHAT_PAINT_MS = 100
 
 # 「文献列表」页下拉框里的第一个选项: 看本地已读文献。其余选项都是某一次的历史
 # 推荐结果 (标签里带时间, 见 past_runs.label_for)。
@@ -298,6 +304,16 @@ class App(tk.Tk):
         # 太亏)。"用对话更新详解"之后要清掉 —— 那份前缀里含旧的详解。
         self._chat_ctx: Dict[str, Any] = {}
         self._chat_papers: Optional[List[Any]] = None   # 文献库列表, 拼上下文用
+        # 这一轮讨论的停止开关。**每问一句换一个新的** —— 上一轮用过的那只已经
+        # 是 set 状态了, 复用会让新一轮刚开口就被判定成"已停止"。
+        self._chat_stop: Optional[threading.Event] = None
+        # 流式渲染要的东西: 正在吐的思考 / 正文, 以及"下次从哪一行开始重画"。
+        self._chat_stream_kind = ""      # "thinking" / "answer" / ""
+        self._chat_stream_think: List[str] = []
+        self._chat_stream_text: List[str] = []
+        self._chat_stream_secs = 0.0     # 思考用了多久 (收起那一行要写)
+        self._chat_tail_at = "end"       # 流式那一段从哪个索引开始
+        self._chat_last_paint = 0.0      # 上次重画的时刻 (节流用)
 
         self.papers: List[Any] = []
         self._current_job = ""
@@ -305,6 +321,10 @@ class App(tk.Tk):
         # 变量 —— 变量得先于这两页存在
         self.var_depth = tk.StringVar(value="sections")
         self._depth_labels: List[tk.Widget] = []
+        # 思考程度。推荐页的对话框和设置页各有一个下拉, 共用这一个变量 —— Tk 的
+        # 变量本来就是双向绑定的, 两个控件自动同步, 一行同步代码都不用写。变量
+        # 必须在这里建: 推荐页在设置页**之前**就搭出来了 (见 _build_ui)。
+        self.var_effort = tk.StringVar(value="")
 
         self.title("daily_arxiv — 文献读取与 arXiv 推荐")
         self.geometry("1220x860")
@@ -722,6 +742,13 @@ class App(tk.Tk):
                                          style="CardQuiet.TButton",
                                          command=self.clear_chat)
         self.btn_chat_clear.pack(side="right", padx=8)
+        # 「撤回上一问」: 把最后一问连同它之后的内容删掉, 那句话放回输入框。
+        # 和「清空」并排 —— 两个都是删, 一个删一条一个删全部, 摆一起才看得出
+        # 谁是轻的谁是重的。不弹确认框: 撤掉的话原样回到输入框, 本身可逆。
+        self.btn_chat_undo = ttk.Button(head, text="撤回上一问",
+                                        style="CardQuiet.TButton",
+                                        command=self.undo_chat)
+        self.btn_chat_undo.pack(side="right")
 
         body = ttk.Frame(box)
         body.pack(side="top", fill="both", expand=True, padx=8, pady=(0, 2))
@@ -744,6 +771,12 @@ class App(tk.Tk):
         self.txt_chat.tag_configure("msg", lmargin1=4, lmargin2=14, spacing3=2)
         self.txt_chat.tag_configure("sys", foreground=theme.MUTED,
                                     lmargin1=4, lmargin2=4, spacing1=4)
+        # 思考过程: 比正文淡、比"系统提示"深一点, 而且整段缩进 —— 一眼要能看出
+        # 这不是答案本身。它只在思考的那几秒里可见, 正文一开始就收成一行。
+        self.txt_chat.tag_configure("think", foreground=theme.MUTED,
+                                    lmargin1=14, lmargin2=20, spacing3=2)
+        self.txt_chat.tag_configure("think_note", foreground=theme.MUTED,
+                                    lmargin1=4, lmargin2=4, spacing1=2)
 
         inp = ttk.Frame(box)
         inp.pack(side="top", fill="x", padx=8, pady=(2, 4))
@@ -754,10 +787,31 @@ class App(tk.Tk):
         self.btn_chat_send = ttk.Button(inp, text="发送", style="Accent.TButton",
                                         command=self.send_chat)
         self.btn_chat_send.pack(side="left", padx=(6, 0))
-        ttk.Label(box, text="回车发送。讨论会存在这篇论文的记录里; 想让它变成详解, "
-                            "点右上角「用对话更新详解」—— 不会每聊一句就自动改详解。",
+        # 停止: 和全局那个停止按钮同一套视觉 —— 忙的时候它是这一块唯一能中断的
+        # 东西, 得一眼看得见。空闲时置灰 (没东西可停)。
+        # 空闲时 CardQuiet 而不是 Quiet: 这一块是**卡片**(白底), 而 Quiet.TButton
+        # 的底色是页面灰 —— 摆进去就是白卡片上的一块灰方块 (自检的底色检查抓过,
+        # 和上面「清空这段对话」踩的是同一个坑)。
+        self.btn_chat_stop = ttk.Button(inp, text="停止",
+                                        style="CardQuiet.TButton",
+                                        command=self.stop_chat, state="disabled")
+        self.btn_chat_stop.pack(side="left", padx=(6, 0))
+        ttk.Label(inp, text="思考程度").pack(side="left", padx=(14, 4))
+        self.cmb_chat_effort = ttk.Combobox(
+            inp, textvariable=self.var_effort, width=8, state="readonly",
+            values=[EFFORT_LABELS[k] for k in EFFORT_LEVELS])
+        self.cmb_chat_effort.pack(side="left")
+        self.cmb_chat_effort.bind("<<ComboboxSelected>>",
+                                  lambda e: self._on_effort_changed())
+        ttk.Label(box, text="回车发送 (Esc 停止)。讨论会存在这篇论文的记录里; "
+                            "想让它变成详解, 点右上角「用对话更新详解」—— 不会"
+                            "每聊一句就自动改详解。\n"
+                            "「思考程度」这一项整个程序通用 (打分、深度解读、"
+                            "讨论都按它走); 改了之后第一次跑推荐会重新调用 AI。",
                   style="CardMuted.TLabel", wraplength=1100,
                   justify="left").pack(side="top", anchor="w", padx=10, pady=(0, 6))
+        # Esc 停思考。绑在输入框上而不是整页: 整页绑会跟别处的 Esc 打架。
+        self.ent_chat.bind("<Escape>", lambda e: self.stop_chat())
         self._render_chat()
 
     # ------------------------------------------------------------------
@@ -1599,7 +1653,20 @@ class App(tk.Tk):
         ttk.Entry(sub, textvariable=self.var_temp, width=6).pack(side="left", padx=(4, 16))
         ttk.Label(sub, text="max_tokens").pack(side="left")
         ttk.Entry(sub, textvariable=self.var_maxtok, width=8).pack(side="left", padx=4)
+        # 思考程度和推荐页那个下拉**共用** self.var_effort, 所以两边自动同步。
+        ttk.Label(sub, text="思考程度").pack(side="left", padx=(16, 4))
+        self.cmb_effort = ttk.Combobox(
+            sub, textvariable=self.var_effort, width=16, state="readonly",
+            values=[EFFORT_LABELS[k] for k in EFFORT_LEVELS])
+        self.cmb_effort.pack(side="left")
+        self.cmb_effort.bind("<<ComboboxSelected>>",
+                             lambda e: self._on_effort_changed())
         ttk.Label(g, text="", width=12).grid(row=4, column=0, sticky="e")
+        ttk.Label(ai, text="思考程度: 推理模型答得多深。这一项整个程序通用 —— "
+                           "打分、深度解读、讨论都按它走。DeepSeek 把「中」当"
+                           "「高」; 改了档位之后第一次跑推荐会重新调用 AI。",
+                  style="CardMuted.TLabel", wraplength=1040).pack(
+            side="top", anchor="w", padx=10, pady=(0, 4))
         ttk.Label(ai, text="常用: DeepSeek https://api.deepseek.com/v1 · "
                            "通义 https://dashscope.aliyuncs.com/compatible-mode/v1 · "
                            "本地 Ollama http://localhost:11434/v1",
@@ -2150,6 +2217,9 @@ class App(tk.Tk):
         self.var_model.set(ai.get("model", ""))
         self.var_temp.set(str(ai.get("temperature", 0.3)))
         self.var_maxtok.set(str(ai.get("max_tokens", 4096)))
+        self.var_effort.set(EFFORT_LABELS.get(
+            str(ai.get("reasoning_effort") or "").strip().lower(),
+            EFFORT_LABELS[""]))
         self.var_proxy.set(net.get("proxy") or "")
         self.var_retries.set(str(net.get("retries", 5)))
         self.var_delay.set(str(arx.get("request_delay", 3.0)))
@@ -2203,6 +2273,14 @@ class App(tk.Tk):
         self.dirty = True
         self.var_dirty.set("有未保存的修改")
 
+    def _on_effort_changed(self) -> None:
+        """档位变了。标脏, 并在推荐页那边说一声 —— 两个下拉共用同一个变量, 所以
+        在推荐页改和在设置页改是同一件事。"""
+        self.mark_dirty()
+        val = effort_value(self.var_effort.get())
+        self.set_status("思考程度: %s (保存后生效)"
+                        % EFFORT_LABELS.get(val, val))
+
     def _collect_into_cfg(self) -> None:
         """把界面上的值写回 ``self.cfg``。"""
         cfg = self.cfg
@@ -2219,6 +2297,8 @@ class App(tk.Tk):
             ai["max_tokens"] = int(float(self.var_maxtok.get()))
         except ValueError:
             pass
+        # 界面上存的是中文名, 配置里存的是档位值 (""/none/low/medium/high)。
+        ai["reasoning_effort"] = effort_value(self.var_effort.get())
 
         net = cfg.setdefault("network", {})
         proxy = self.var_proxy.get().strip()
@@ -2463,10 +2543,16 @@ class App(tk.Tk):
                     self._on_chat_reply(msg[1], msg[2])
                 elif kind == "chat_err":
                     self._on_chat_fail(msg[1], msg[2])
+                elif kind == "chat_delta":
+                    self._on_chat_delta(msg[1], msg[2], msg[3], msg[4])
+                elif kind == "chat_stopped":
+                    self._on_chat_stopped(msg[1])
                 elif kind == "chat_meta":
                     self._on_chat_meta(msg[1])
                 elif kind == "chat_detail":
                     self._on_chat_detail(msg[1], msg[2])
+                elif kind == "chat_detail_stopped":
+                    self._on_chat_detail_stopped(msg[1])
                 elif kind == "chat_detail_err":
                     self._on_chat_detail_fail(msg[1], msg[2])
         except queue.Empty:
@@ -3039,6 +3125,8 @@ class App(tk.Tk):
         txt = getattr(self, "txt_chat", None)
         if txt is None:
             return
+        # 贴不贴着底, 在**清空之前**问 —— 清空之后问就永远贴着底了。
+        at_bottom = self._chat_at_bottom()
         txt.configure(state="normal")
         txt.delete("1.0", "end")
         if not self._chat_msgs:
@@ -3057,10 +3145,54 @@ class App(tk.Tk):
             txt.insert("end", "%s\n" % label,
                        "who_user" if who == "user" else "who_ai")
             txt.insert("end", "%s\n" % str(m.get("content") or "").strip(), "msg")
-        if self._chat_busy_aid:
-            txt.insert("end", "AI 正在思考…\n", "sys")
+        # 流式那一段从这儿开始 —— 后面重画只动这一截 (见 _paint_chat_tail)。
+        self._chat_tail_at = txt.index("end-1c")
+        self._paint_chat_tail(txt)
         txt.configure(state="disabled")
-        txt.see("end")
+        # 只在**本来就贴着底**的时候跟到底: 用户往上翻着看的时候, 每来一个字
+        # 就被拽回底部是没法读的。
+        if at_bottom:
+            txt.see("end")
+
+    def _chat_at_bottom(self) -> bool:
+        """对话区现在是不是贴着底 (留一行余量)。"""
+        txt = getattr(self, "txt_chat", None)
+        if txt is None:
+            return True
+        try:
+            return txt.yview()[1] >= 0.999
+        except Exception:
+            return True
+
+    def _paint_chat_tail(self, txt: Any = None) -> None:
+        """只重画对话区**末尾那一截** (流式思考/正文)。
+
+        整块重画是 O(n²): 一段 2000 字的回答按 100ms 一次刷新, 每次都要把前面
+        所有消息重新 insert 一遍。这里记着上次画到哪个索引, 从那儿删掉重画 ——
+        前面已经画好的部分一个字都不动。
+        """
+        if txt is None:
+            txt = getattr(self, "txt_chat", None)
+        if txt is None:
+            return
+        start = getattr(self, "_chat_tail_at", "end-1c")
+        txt.delete(start, "end")
+        if self._chat_stream_text:
+            # 正文已经开始了: 思考收成一行, 然后正文照常铺开。
+            if self._chat_stream_think:
+                txt.insert("end", self._think_note() + "\n", "think_note")
+            txt.insert("end", "AI\n", "who_ai")
+            txt.insert("end", "%s\n" % "".join(self._chat_stream_text), "msg")
+        elif self._chat_stream_think:
+            txt.insert("end", "AI 正在思考…\n", "who_ai")
+            txt.insert("end", "%s\n" % "".join(self._chat_stream_think), "think")
+        elif self._chat_busy_aid:
+            txt.insert("end", "AI 正在思考…\n", "sys")
+
+    def _think_note(self) -> str:
+        """思考收起来之后留下的那一行。"""
+        return "（思考了 %.0f 秒 · %d 字）" % (
+            self._chat_stream_secs, len("".join(self._chat_stream_think)))
 
     def _load_chat_for(self, c: Any) -> None:
         """选中的论文换了 -> 把这篇文章的讨论记录读出来铺进对话区。
@@ -3162,11 +3294,13 @@ class App(tk.Tk):
         self.var_chat_in.set("")
         self._chat_msgs.append({"role": "user", "content": text})
         self._chat_busy_aid = aid
+        self._begin_chat_stream()
         self._render_chat()
-        self.btn_chat_send.configure(state="disabled")
+        self._set_chat_buttons(busy=True)
 
         history_msgs = list(self._chat_msgs[:-1])   # 不含刚问的这一句
         title = (getattr(c, "title", "") or "").replace("$", "")
+        stop = self._chat_stop
 
         def _work() -> None:
             try:
@@ -3181,17 +3315,86 @@ class App(tk.Tk):
                 if chat_mod.ensure_abstract(cfg, c, cache=cache):
                     self.queue.put(("chat_meta", aid))
                 prefix, _labels = self._chat_context(cfg, c)
-                answer = chat_mod.reply(ai, prefix, history_msgs, text)
+                answer = chat_mod.reply(
+                    ai, prefix, history_msgs, text,
+                    on_delta=lambda kind, piece, secs: self.queue.put(
+                        ("chat_delta", aid, kind, piece, secs)),
+                    stop_event=stop)
                 if not answer:
                     self.queue.put(("chat_err", aid, "AI 返回了空内容"))
                     return
                 append_chat(cfg, aid, "assistant", answer)
                 self.queue.put(("chat_ok", aid, answer))
+            except AIStopped:
+                # 用户自己按的停止, 不是失败 —— 走 chat_stopped, 界面按"停下来
+                # 了"处理 (留着已经吐出来的半截正文), 不报错也不弹任何东西。
+                self.queue.put(("chat_stopped", aid))
             except Exception as exc:
                 self.queue.put(("chat_err", aid, "%s" % exc))
 
         self._chat_thread = threading.Thread(target=_work, daemon=True)
         self._chat_thread.start()
+
+    def _begin_chat_stream(self) -> None:
+        """清掉上一轮的流式残留, 并换一只新的停止开关。"""
+        self._chat_stop = threading.Event()
+        self._chat_stream_kind = ""
+        self._chat_stream_think = []
+        self._chat_stream_text = []
+        self._chat_stream_secs = 0.0
+        self._chat_last_paint = 0.0
+
+    def _set_chat_buttons(self, busy: bool) -> None:
+        """忙/闲时那一排按钮的样子。发送和"停止"是互斥的。"""
+        self.btn_chat_send.configure(state="disabled" if busy else "normal")
+        self.btn_chat_detail.configure(
+            state="disabled" if busy else "normal")
+        # 停止按钮: 空闲时灰描边且不可点; 一忙就换成实心红色 —— 和全局停止按钮
+        # 一个道理, 忙的时候它是这一块唯一能中断的东西。
+        self.btn_chat_stop.configure(
+            state="normal" if busy else "disabled",
+            style="Stop.TButton" if busy else "CardQuiet.TButton",
+            text="停止")
+        # 撤回: 忙的时候不能点 —— 那条记录正被后台线程拿在手里。
+        self.btn_chat_undo.configure(state="disabled" if busy else "normal")
+
+    def stop_chat(self) -> None:
+        """停止正在进行的思考。"""
+        ev = self._chat_stop
+        if not self._chat_busy_aid or ev is None:
+            return
+        ev.set()
+        # 立刻变样并置灰: 停止是下一个检查点才生效的 (正在收的那一行要读完),
+        # 按钮不变样用户就会连点 —— 那才是"停止按钮好像坏了"的来源。
+        self.btn_chat_stop.configure(text="停止中 …", state="disabled")
+        self.set_status("已请求停止 …")
+        self._append_log("已请求停止这次讨论的思考。", "warn")
+
+    def _on_chat_delta(self, aid: str, kind: str, piece: str,
+                       secs: float) -> None:
+        """流式的一小段。**只在主线程跑** (经 _poll 转过来)。"""
+        if str(getattr(self._chat_paper, "arxiv_id", "") or "") != aid:
+            return          # 等回复的时候换到别的论文去了, 不往这一屏上贴
+        if kind == "thinking":
+            self._chat_stream_think.append(piece)
+        else:
+            self._chat_stream_text.append(piece)
+        self._chat_stream_kind = kind
+        self._chat_stream_secs = secs
+        # 节流: 每个 token 都重画一次会把主线程吃满, 而且人眼也跟不上。
+        now = time.monotonic()
+        if now - self._chat_last_paint < CHAT_PAINT_MS / 1000.0:
+            return
+        self._chat_last_paint = now
+        txt = getattr(self, "txt_chat", None)
+        if txt is None:
+            return
+        at_bottom = self._chat_at_bottom()
+        txt.configure(state="normal")
+        self._paint_chat_tail(txt)
+        txt.configure(state="disabled")
+        if at_bottom:
+            txt.see("end")
 
     def _history_hint(self) -> str:
         try:
@@ -3202,21 +3405,65 @@ class App(tk.Tk):
 
     def _on_chat_reply(self, aid: str, text: str) -> None:
         self._chat_busy_aid = ""
-        self.btn_chat_send.configure(state="normal")
+        self._set_chat_buttons(busy=False)
         if str(getattr(self._chat_paper, "arxiv_id", "") or "") == aid:
             self._chat_msgs.append({"role": "assistant", "content": text})
+            self._end_chat_stream()
             self._render_chat()
         else:
             # 等回复的时候用户换到别的论文去了。回复照常存进库 (上面已经存了),
             # 只是不往现在这一屏上贴 —— 贴上去就是张冠李戴。
             self._append_log("AI 对 %s 的回复已存进那篇论文的讨论记录" % aid, "info")
+            self._end_chat_stream()
             self._render_chat()
         self._append_log("讨论: %s 已回复 (%d 字)" % (aid, len(text)), "ok")
         self.set_status("讨论: 已回复 (%d 字)" % len(text))
 
+    def _end_chat_stream(self) -> None:
+        """流式那一段结束了 (答完/停下/出错), 把临时状态清干净。
+
+        清掉之后 ``_paint_chat_tail`` 什么都不画, 而正文已经作为一条普通消息
+        进了 ``_chat_msgs`` —— 所以这一清就是"把还在流的那份换成落库的那份",
+        不会出现两段正文。
+        """
+        self._chat_stream_kind = ""
+        self._chat_stream_think = []
+        self._chat_stream_text = []
+        self._chat_stream_secs = 0.0
+
+    def _on_chat_stopped(self, aid: str) -> None:
+        """用户按了停止。**不是失败**, 所以不报错、不弹窗、不写"没答上来"。"""
+        self._chat_busy_aid = ""
+        self._set_chat_buttons(busy=False)
+        partial = "".join(self._chat_stream_text).strip()
+        if str(getattr(self._chat_paper, "arxiv_id", "") or "") != aid:
+            self._end_chat_stream()
+            self._render_chat()
+            self._append_log("讨论: %s 的那次思考已停止" % aid, "warn")
+            return
+        if partial:
+            # 已经吐出来的半截正文**留着**: 那是真答出来的内容, 扔了可惜。加一句
+            # 说明, 免得下次看记录的人以为 AI 就是这么短。
+            note = partial + "\n\n(以上是停止前已经生成的部分, 没有写完)"
+            from .history import append_chat
+            append_chat(self.cfg, aid, "assistant", note)
+            self._chat_msgs.append({"role": "assistant", "content": note})
+            self._append_log("讨论: 已停止, 保留已生成的 %d 字" % len(partial), "warn")
+            self.set_status("已停止 (保留了已经生成的部分)")
+        else:
+            # 一个字都没吐出来: 不落库, 只在对话区留一行灰字。落一条空的
+            # assistant 记录的话, 下次追问会把这段空内容一起发出去。
+            self._chat_msgs.append(
+                {"role": "assistant", "content": "(已停止, 这次没有生成内容)"})
+            self._append_log("讨论: 已停止 (没有生成内容)", "warn")
+            self.set_status("已停止")
+        self._end_chat_stream()
+        self._render_chat()
+
     def _on_chat_fail(self, aid: str, msg: str) -> None:
         self._chat_busy_aid = ""
-        self.btn_chat_send.configure(state="normal")
+        self._set_chat_buttons(busy=False)
+        self._end_chat_stream()
         self._append_log("讨论失败: %s" % msg, "err")
         self.set_status("讨论失败: %s" % msg)
         if str(getattr(self._chat_paper, "arxiv_id", "") or "") == aid:
@@ -3234,6 +3481,50 @@ class App(tk.Tk):
             return
         self._show_detail(c)
         self._append_log("讨论: 已从 arXiv 取回 %s 的摘要" % aid, "info")
+
+    def undo_chat(self) -> None:
+        """撤回上一问: 删掉最后一问及其之后的内容, 那句话放回输入框。
+
+        可以连点, 一次退一问。**不弹确认框** —— 撤掉的那句话原样回到输入框里,
+        本身就是可逆的; 「清空这段对话」是全删, 那个才需要确认。
+        """
+        c = self._chat_paper
+        if c is None:
+            messagebox.showinfo("先选一篇", "在上面的列表里点一篇论文, 再点这里。")
+            return
+        if self._chat_busy_aid:
+            messagebox.showinfo("正在等回复",
+                                "这一轮还在跑, 停下来 (或等它答完) 再撤回。")
+            return
+        aid = str(getattr(c, "arxiv_id", "") or "")
+        if not aid:
+            return
+        self._collect_into_cfg()
+        from .history import pop_chat
+        got = pop_chat(self.cfg, aid)
+        n = int(got.get("removed") or 0)
+        if not n:
+            messagebox.showinfo("没有可撤回的", "这篇还没有问过问题。")
+            return
+        # 内存里那份也照着裁: 从最后一条 user 消息起全删 —— 和库里那条 SQL
+        # 同一个语义, 两处要一致。
+        last = -1
+        for i, m in enumerate(self._chat_msgs):
+            if str(m.get("role")) == "user":
+                last = i
+        if last >= 0:
+            del self._chat_msgs[last:]
+        self._end_chat_stream()
+        self._render_chat()
+        # 那句话放回输入框, 光标放末尾 —— 用户接着改几个字就能重发。
+        self.var_chat_in.set(str(got.get("question") or ""))
+        try:
+            self.ent_chat.focus_set()
+            self.ent_chat.icursor("end")
+        except Exception:
+            pass
+        self._append_log("讨论: 撤回了 %s 的最后一问 (%d 条记录)" % (aid, n), "warn")
+        self.set_status("已撤回上一问, 那句话回到输入框了")
 
     def clear_chat(self) -> None:
         """清空**这一段**对话 (推荐记录里的标题、分数、解读一概不动)。"""
@@ -3283,12 +3574,14 @@ class App(tk.Tk):
         cfg = self.cfg
         if self.dirty:
             self.save_config()
-        self.btn_chat_detail.configure(state="disabled")
         self.btn_chat_detail.configure(text="正在更新…")
         self._chat_busy_aid = aid
+        self._begin_chat_stream()
+        self._set_chat_buttons(busy=True)
         self._render_chat()
         msgs = list(self._chat_msgs)
         title = (getattr(c, "title", "") or "").replace("$", "")
+        stop = self._chat_stop
 
         def _work() -> None:
             try:
@@ -3301,7 +3594,9 @@ class App(tk.Tk):
                     pass
                 chat_mod.ensure_abstract(cfg, c, cache=cache)
                 prefix, labels = self._chat_context(cfg, c)
-                got = chat_mod.rewrite_analysis(ai, prefix, msgs, labels)
+                # 只透 stop_event, 不透 on_delta —— 见 chat.rewrite_analysis。
+                got = chat_mod.rewrite_analysis(ai, prefix, msgs, labels,
+                                                stop_event=stop)
                 if not (got.get("summary") or got.get("ideas")):
                     self.queue.put(("chat_detail_err", aid, "AI 没能给出新的详解"))
                     return
@@ -3318,6 +3613,8 @@ class App(tk.Tk):
                 _apply_chat_analysis(c, got)
                 save_analysis(cfg, c, fp)
                 self.queue.put(("chat_detail", aid, got))
+            except AIStopped:
+                self.queue.put(("chat_detail_stopped", aid))
             except Exception as exc:
                 self.queue.put(("chat_detail_err", aid, "%s" % exc))
 
@@ -3327,8 +3624,8 @@ class App(tk.Tk):
     def _on_chat_detail(self, aid: str, got: Dict[str, Any]) -> None:
         """详解更新完了: 内存里的候选对象、列表那一行的标记、详解面板一起刷新。"""
         self._chat_busy_aid = ""
-        self.btn_chat_detail.configure(state="normal")
         self.btn_chat_detail.configure(text="用对话更新详解")
+        self._set_chat_buttons(busy=False)
         c = self._chat_paper
         if c is None or str(getattr(c, "arxiv_id", "") or "") != aid:
             self._append_log("讨论: %s 的详解已按讨论更新并写回记录" % aid, "ok")
@@ -3344,6 +3641,16 @@ class App(tk.Tk):
                          "ok")
         self.set_status("详解已按讨论更新 (写回推荐记录)")
 
+    def _on_chat_detail_stopped(self, aid: str) -> None:
+        """「用对话更新详解」被停掉了。对话一个字没动, 详解也没改。"""
+        self._chat_busy_aid = ""
+        self.btn_chat_detail.configure(text="用对话更新详解")
+        self._end_chat_stream()
+        self._set_chat_buttons(busy=False)
+        self._render_chat()
+        self._append_log("更新详解已停止 (对话和详解都没动)", "warn")
+        self.set_status("已停止, 详解没有改动")
+
     def _on_chat_detail_fail(self, aid: str, msg: str) -> None:
         """更新详解失败: 把按钮**放回可点的样子**, 别的照旧。
 
@@ -3352,8 +3659,9 @@ class App(tk.Tk):
         对话本身好好的, 一句没丢。
         """
         self._chat_busy_aid = ""
-        self.btn_chat_detail.configure(state="normal")
         self.btn_chat_detail.configure(text="用对话更新详解")
+        self._end_chat_stream()
+        self._set_chat_buttons(busy=False)
         # 重画一下: 刚才置了 busy, 对话区末尾挂着一行"AI 正在思考…", 得撤掉
         self._render_chat()
         self._append_log("更新详解失败: %s (对话没动, 可以再点一次)" % msg, "err")

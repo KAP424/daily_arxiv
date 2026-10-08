@@ -850,14 +850,22 @@ def retry_call(
     retries: int = 3,
     base_delay: float = 2.0,
     label: str = "call",
+    can_retry: Optional[Callable[[BaseException], bool]] = None,
 ) -> Any:
-    """对任意可调用对象做指数退避重试。"""
+    """对任意可调用对象做指数退避重试。
+
+    ``can_retry`` 给"重试本身会造成伤害"的场合用: 它拿到异常, 返回 False 就立刻
+    抛出, 一次都不再试。典型是流式回复 —— 已经往界面上吐了一半字, 重来一遍会在
+    对话区里留下两段半截答案, 比直接报错难看得多。
+    """
     last = None
     for attempt in range(retries):
         try:
             return fn()
         except Exception as exc:
             last = exc
+            if can_retry is not None and not can_retry(exc):
+                raise
             if attempt == retries - 1:
                 break
             delay = base_delay * (2 ** attempt) + random.uniform(0, 1.0)

@@ -3558,6 +3558,392 @@ else:
                     except OSError:
                         pass
 
+
+# ---------------------------------------------------------------------------
+# 38) 思考档位 / 流式 SSE 解析 / 撤回上一问
+# ---------------------------------------------------------------------------
+print()
+print("=" * 70)
+print("38) 思考档位、流式解析、撤回上一问")
+print("=" * 70)
+
+import json
+from arxiv_rec import ai as _ai38
+from arxiv_rec import history as _hist38
+
+# --- 档位: 界面上的中文名 <-> 配置里存的值 ---
+check("五档 (含默认)", _ai38.EFFORT_LEVELS == ("", "none", "low", "medium", "high"),
+      _ai38.EFFORT_LEVELS)
+check("每一档都有中文名", all(k in _ai38.EFFORT_LABELS for k in _ai38.EFFORT_LEVELS))
+check("中文名反查回原值",
+      all(_ai38.effort_value(_ai38.EFFORT_LABELS[k]) == k
+          for k in _ai38.EFFORT_LEVELS))
+check("认不出来的中文名当默认 (不炸)",
+      _ai38.effort_value("瞎写的") == "" and _ai38.effort_value(None) == "")
+check("中文名互不重复 (两个档共用一个名字就选不准了)",
+      len(set(_ai38.EFFORT_LABELS.values())) == len(_ai38.EFFORT_LABELS))
+
+# --- SSE 解析: 两种协议各喂固定字节流, 不碰网络 ---
+_ant_think = {"type": "content_block_delta",
+              "delta": {"type": "thinking_delta", "thinking": "先想"}}
+_ant_text = {"type": "content_block_delta",
+             "delta": {"type": "text_delta", "text": "答案是"}}
+check("Anthropic: 思考单独认出来",
+      _ai38.parse_stream_event("anthropic", _ant_think) == ("thinking", "先想"),
+      _ai38.parse_stream_event("anthropic", _ant_think))
+check("Anthropic: 正文认成 answer",
+      _ai38.parse_stream_event("anthropic", _ant_text) == ("answer", "答案是"))
+check("Anthropic: 别的块类型不给文本 (message_start 之类)",
+      _ai38.parse_stream_event("anthropic", {"type": "message_start"}) == ("", ""))
+check("Anthropic: ping 不给文本",
+      _ai38.parse_stream_event("anthropic", {"type": "ping"}) == ("", ""))
+
+_oai_think = {"choices": [{"delta": {"reasoning_content": "推"}}]}
+_oai_alt = {"choices": [{"delta": {"reasoning": "推"}}]}
+_oai_text = {"choices": [{"delta": {"content": "答"}}]}
+check("OpenAI: reasoning_content 是思考",
+      _ai38.parse_stream_event("openai", _oai_think) == ("thinking", "推"))
+check("OpenAI: 网关叫 reasoning 的也认",
+      _ai38.parse_stream_event("openai", _oai_alt) == ("thinking", "推"))
+check("OpenAI: content 是正文",
+      _ai38.parse_stream_event("openai", _oai_text) == ("answer", "答"))
+check("OpenAI: 收尾块 (delta 空) 不给文本",
+      _ai38.parse_stream_event("openai", {"choices": [{"delta": {}}]}) == ("", ""))
+check("OpenAI: 没有 choices 不给文本",
+      _ai38.parse_stream_event("openai", {"usage": {}}) == ("", ""))
+check("思考优先于正文 (两个都在时按思考算, 免得思考被当成答案显示)",
+      _ai38.parse_stream_event(
+          "openai", {"choices": [{"delta": {"reasoning_content": "推",
+                                            "content": "答"}}]})[0] == "thinking")
+
+check("Anthropic 用量: message_start 给输入",
+      _ai38.stream_usage("anthropic", {"type": "message_start",
+                                       "message": {"usage": {"input_tokens": 7}}})
+      == (7, 0))
+check("Anthropic 用量: message_delta 给输出",
+      _ai38.stream_usage("anthropic", {"type": "message_delta",
+                                       "usage": {"output_tokens": 9}}) == (0, 9))
+check("OpenAI 用量: 挂在最后一个 chunk 上",
+      _ai38.stream_usage("openai", {"usage": {"prompt_tokens": 3,
+                                              "completion_tokens": 4}}) == (3, 4))
+check("没有用量时给 0 (不能返回 None 让调用方去加)",
+      _ai38.stream_usage("openai", {}) == (0, 0))
+
+check("流里夹带的错误能认出来 (Anthropic 的 error 事件)",
+      bool(_ai38.stream_error({"type": "error",
+                               "error": {"message": "超了"}})))
+check("流里夹带的错误能认出来 (OpenAI 的 error 字段)",
+      bool(_ai38.stream_error({"error": {"message": "超了"}})))
+check("正常块不算错误", _ai38.stream_error({"choices": []}) == "")
+
+# --- 档位 -> 请求体 ---
+_eff_cfg = {"ai": {"provider": "openai", "base_url": "http://x/v1",
+                   "api_key": "k", "model": "m"}}
+
+
+def _payload_for(effort, provider="openai", extra=None, **over):
+    ai = dict(_eff_cfg["ai"])
+    ai["provider"] = provider
+    ai["reasoning_effort"] = effort
+    if extra is not None:
+        ai["extra_body"] = extra
+    ai.update(over)
+    cl = _ai38.build_client({"ai": ai}, None)
+    return cl._payload("sys", "usr", False)
+
+
+check("默认档: 请求体里没有 reasoning_effort (和服务端默认一模一样)",
+      "reasoning_effort" not in _payload_for(""),
+      sorted(_payload_for("").keys()))
+check("none 档: 发 reasoning_effort=none",
+      _payload_for("none").get("reasoning_effort") == "none")
+check("low/high 档: 原样发过去",
+      _payload_for("low").get("reasoning_effort") == "low"
+      and _payload_for("high").get("reasoning_effort") == "high")
+check("不认识的档位按默认处理 (只警告, 不把请求搞坏)",
+      "reasoning_effort" not in _payload_for("bogus"))
+
+_ant_cfg = {"ai": {"provider": "anthropic", "base_url": "http://x/v1",
+                   "api_key": "k", "model": "m", "max_tokens": 4096}}
+
+
+def _ant_payload(effort, **over):
+    ai = dict(_ant_cfg["ai"])
+    ai["reasoning_effort"] = effort
+    ai.update(over)
+    return _ai38.build_client({"ai": ai}, None)._payload("sys", "usr", False)
+
+
+check("Anthropic 默认档: 没有 thinking 字段",
+      "thinking" not in _ant_payload(""), sorted(_ant_payload("").keys()))
+check("Anthropic none 档: thinking 关掉",
+      _ant_payload("none").get("thinking") == {"type": "disabled"})
+check("Anthropic low 档: 开思考并给预算",
+      _ant_payload("low").get("thinking")
+      == {"type": "enabled", "budget_tokens": _ai38.ANTHROPIC_BUDGET["low"]})
+check("Anthropic 高 > 中 > 低 (预算递增)",
+      _ai38.ANTHROPIC_BUDGET["low"] < _ai38.ANTHROPIC_BUDGET["medium"]
+      < _ai38.ANTHROPIC_BUDGET["high"])
+check("Anthropic 开思考时不传 temperature (官方要求 temperature 只能是 1)",
+      "temperature" not in _ant_payload("high"),
+      sorted(_ant_payload("high").keys()))
+check("Anthropic 不开思考时照旧传 temperature",
+      "temperature" in _ant_payload(""))
+check("Anthropic 开思考时 max_tokens 自动抬高 (预算比 max_tokens 大就会被拒)",
+      _ant_payload("high").get("max_tokens") > 4096,
+      _ant_payload("high").get("max_tokens"))
+check("Anthropic max_tokens 抬得有上限 (不能无边)",
+      _ant_payload("high", max_tokens=100).get("max_tokens") <= 64000,
+      _ant_payload("high", max_tokens=100).get("max_tokens"))
+check("Anthropic max_tokens 本来就够大时不缩 (用户设的更大就听用户的)",
+      _ant_payload("low", max_tokens=100000).get("max_tokens") == 100000,
+      _ant_payload("low", max_tokens=100000).get("max_tokens"))
+
+# --- extra_body: 逃生口 ---
+_eb = _payload_for("", extra={"top_p": 0.9})
+check("extra_body 并进了请求体", _eb.get("top_p") == 0.9, _eb.get("top_p"))
+_eb2 = _payload_for("high", extra={"reasoning_effort": "max"})
+check("extra_body 能覆盖自动生成的字段 (网关有自己说法时听用户的)",
+      _eb2.get("reasoning_effort") == "max", _eb2.get("reasoning_effort"))
+check("extra_body 不是对象时当没写 (不炸)",
+      "top_p" not in _payload_for("", extra="不是对象"))
+_cl = _ai38.build_client({"ai": dict(_eff_cfg["ai"],
+                                     extra_body={"a": 1, "b": 2})}, None)
+check("可退让字段里包含 extra_body 的键",
+      set(_cl._optional_keys(_cl._payload("s", "u", False))) >= {"a", "b"},
+      _cl._optional_keys(_cl._payload("s", "u", False)))
+
+# --- 缓存键: 默认档必须和"没有这个功能"时算出来的键**一模一样** ---
+# 这是补丁版本的一条硬要求: 老用户升级上来, 缓存目录里那几百份 AI 回复得继续命中。
+# 键里多塞两个字段 (哪怕是空值) 会让每一份老缓存都失效 —— 用户只是升了个小版本,
+# 下一次跑推荐却要把几百次 AI 调用重打一遍, 又慢又费钱。
+_ck_base = {"p": "openai", "m": "m", "t": 0.3, "s": "SYS", "u": "USR", "j": False}
+
+
+def _old_cache_key():
+    """加这个功能**之前**那份代码算出来的键 (字段和顺序都照抄老版本)。"""
+    return json.dumps(dict(_ck_base), ensure_ascii=False, sort_keys=True)
+
+
+def _new_cache_key(effort="", extra=None):
+    ai = dict(_eff_cfg["ai"])
+    ai["reasoning_effort"] = effort
+    if extra is not None:
+        ai["extra_body"] = extra
+    cl = _ai38.build_client({"ai": ai}, None)
+    cl.temperature = 0.3
+    cl.provider, cl.model = "openai", "m"
+    seen = {}
+    cl.cache = type("_C", (), {"get": lambda self, k: seen.setdefault("k", k),
+                               "set": lambda self, k, v: None})()
+    cl._raw_chat = lambda system, user, json_mode: "x"
+    cl._chat_blocking("SYS", "USR", False, True)
+    return seen["k"]
+
+
+check("默认档的缓存键和加功能之前逐字节相同 (老缓存不作废)",
+      _new_cache_key() == _old_cache_key(),
+      repr(_new_cache_key()[:60]) + " vs " + repr(_old_cache_key()[:60]))
+check("换了档位缓存键就变 (改了档位要重新调 AI, 不能命中旧档位的)",
+      _new_cache_key("high") != _old_cache_key()
+      and _new_cache_key("high") != _new_cache_key("low"))
+check("extra_body 进了缓存键",
+      _new_cache_key("", {"top_p": 0.9}) != _old_cache_key())
+
+# --- 400/422 退让: 假接口逐个拒绝, 看它是不是一个一个去掉重发 ---
+class _Resp38:
+    def __init__(self, code, body="{}", ctype="application/json"):
+        self.status_code = code
+        self.text = body
+        self.headers = {"Content-Type": ctype}
+        self.encoding = None
+        self.closed = False
+
+    def json(self):
+        return json.loads(self.text)
+
+    def close(self):
+        self.closed = True
+
+
+class _Sess38:
+    """假 session: 认得的字段集合固定, 多一个就 400。"""
+
+    def __init__(self, accepts):
+        self.accepts = set(accepts)
+        self.bodies = []
+
+    def post(self, url, headers=None, data=None, timeout=None, stream=False,
+             proxies=None):
+        body = json.loads(data.decode("utf-8"))
+        self.bodies.append(body)
+        extra = set(body) - self.accepts - {"model", "messages", "max_tokens",
+                                            "temperature", "system", "stream"}
+        if extra:
+            return _Resp38(400, json.dumps({"error": "不认 %s" % sorted(extra)}))
+        if stream:
+            return _Resp38(200, "data: " + "{}" + chr(10) + chr(10),
+                           "text/event-stream")
+        return _Resp38(200, json.dumps({
+            "choices": [{"message": {"content": "好"}}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 2}}))
+
+
+def _client38(sess, **ai_over):
+    ai = {"provider": "openai", "base_url": "http://x/v1", "api_key": "k",
+          "model": "m", "max_retries": 1}
+    ai.update(ai_over)
+    cl = _ai38.build_client({"ai": ai}, None)
+    cl._session = sess
+    return cl
+
+
+# 接口认 response_format 和 reasoning_effort, 不认 thinking (extra_body 塞的)
+_s38 = _Sess38({"response_format", "reasoning_effort"})
+_c38 = _client38(_s38, reasoning_effort="low", extra_body={"thinking": {"x": 1}})
+_txt38 = _c38.chat("s", "u", json_mode=True, use_cache=False)
+check("退让之后照样拿到了回答", _txt38 == "好", _txt38)
+check("退让是**逐个**去掉字段重发 (不是一刀切全去掉)",
+      len(_s38.bodies) >= 2, [sorted(b) for b in _s38.bodies])
+check("最后一发里没有了被拒的字段",
+      "thinking" not in _s38.bodies[-1], sorted(_s38.bodies[-1]))
+# "逐个去"的确切含义: 每一发比上一发**正好少一个**字段, 而不是一次全砍。
+# (被拒的是 thinking, 它在最后; 所以最后一发里确实一个可选项都不剩 —— 这不算
+# 连坐, 而是那个字段本来就在名单末尾。真正要防的是"第一发失败就全砍掉"。)
+_drops = [len(_s38.bodies[i]) - len(_s38.bodies[i + 1])
+          for i in range(len(_s38.bodies) - 1)]
+check("退让是每次只去掉一个字段 (不是一次全砍)",
+      all(d == 1 for d in _drops), _drops)
+check("先去掉的是 response_format 那一档 (按最可能多余的排在前面)",
+      "response_format" not in _s38.bodies[1], sorted(_s38.bodies[1]))
+
+# 全都不认 -> 最后一次是不带任何可选项的那一发
+_s38b = _Sess38(set())
+_c38b = _client38(_s38b, reasoning_effort="high")
+check("全不认时最后一发什么可选项都没有",
+      _c38b.chat("s", "u", json_mode=True, use_cache=False) == "好"
+      and not ({"response_format", "reasoning_effort"} & set(_s38b.bodies[-1])),
+      sorted(_s38b.bodies[-1]))
+
+# 400 不该被重试三轮 (请求体有问题, 原样再发结果一样)
+_s38c = _Sess38(set())
+_c38c = _client38(_s38c, max_retries=5, reasoning_effort="high")
+_c38c.chat("s", "u", json_mode=True, use_cache=False)
+check("400 不会被 retry_call 反复重试 (只按退让计划发, 每档一次)",
+      len(_s38c.bodies) <= 4, len(_s38c.bodies))
+
+# 非 400 的错照旧走重试 -> 这里只验它确实抛出来 (不吞)
+class _Sess38Err(_Sess38):
+    def post(self, *a, **kw):
+        return _Resp38(500, "炸了")
+
+
+try:
+    _client38(_Sess38Err(set()), max_retries=1).chat("s", "u", use_cache=False)
+    check("5xx 会抛 AIError", False, "没抛")
+except _ai38.AIError as _e38:
+    check("5xx 会抛 AIError", True)
+    check("5xx 不是 AIRejected (那种才不重试)",
+          not isinstance(_e38, _ai38.AIRejected), type(_e38).__name__)
+
+# 400 抛的是 AIRejected, 且带着状态码
+_s38d = _Sess38(set())
+
+
+class _Sess38Reject:
+    def post(self, url, headers=None, data=None, timeout=None, stream=False,
+             proxies=None):
+        return _Resp38(422, "不行")
+
+
+try:
+    _client38(_Sess38Reject(), max_retries=1).chat("s", "u", use_cache=False)
+    check("422 抛 AIRejected", False, "没抛")
+except _ai38.AIRejected as _e38b:
+    check("422 抛 AIRejected", True)
+    check("AIRejected 带着状态码 (退让逻辑靠它判断, 不抠错误文本)",
+          _e38b.status == 422, _e38b.status)
+    check("AIRejected 也是 AIError (上层不用改 except 子句)",
+          isinstance(_e38b, _ai38.AIError))
+
+# --- 流式请求体里带上 stream: true ---
+_s38e = _Sess38({"response_format"})
+_c38e = _client38(_s38e, max_retries=1)
+_c38e._post("s", "u", False, stream=True)
+check("流式那一发带上了 stream: true", _s38e.bodies[-1].get("stream") is True,
+      _s38e.bodies[-1].get("stream"))
+check("阻塞那一发不带 stream", "stream" not in _c38e._payload("s", "u", False),
+      sorted(_c38e._payload("s", "u", False).keys()))
+
+# 网关把 stream 当没看见 (200 但回的是 JSON): 认出来, 按普通响应解析
+_s38f = _Sess38({"response_format"})
+
+
+class _Sess38NoStream(_Sess38):
+    def post(self, url, headers=None, data=None, timeout=None, stream=False,
+             proxies=None):
+        body = json.loads(data.decode("utf-8"))
+        self.bodies.append(body)
+        return _Resp38(200, json.dumps({
+            "choices": [{"message": {"content": "没在流, 但我答了"}}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 2}}))
+
+
+_c38f = _client38(_Sess38NoStream({"response_format"}), max_retries=1)
+_got38f = _c38f.chat("s", "u", use_cache=False, on_delta=lambda *a: None)
+check("网关不真流 (200 回 JSON) 时也能拿到正文, 不是空答案",
+      _got38f == "没在流, 但我答了", repr(_got38f))
+check("认出一次之后就记住了 (不再每轮撞一遍)",
+      _c38f._stream_ok is False, _c38f._stream_ok)
+
+# --- 撤回上一问: 在临时库上验 SQL 语义 ---
+_tmp38 = tempfile.mkdtemp(prefix="daily_arxiv_undo_")
+_hdb38 = os.path.join(_tmp38, "h.sqlite")
+_hcfg38 = {"analysis": {"history_db": _hdb38}}
+try:
+    _hist38.append_chat(_hcfg38, "2401.1", "user", "第一问")
+    _hist38.append_chat(_hcfg38, "2401.1", "assistant", "第一答")
+    _hist38.append_chat(_hcfg38, "2401.1", "user", "第二问")
+    _hist38.append_chat(_hcfg38, "2401.1", "assistant", "第二答")
+    _hist38.append_chat(_hcfg38, "2401.2", "user", "别的论文的问题")
+    check("撤回前有 4 条 (这篇)", len(_hist38.load_chat(_hcfg38, "2401.1")) == 4,
+          len(_hist38.load_chat(_hcfg38, "2401.1")))
+
+    _r38 = _hist38.pop_chat(_hcfg38, "2401.1")
+    check("撤回了 2 条 (第二问 + 它之后的第二答)", _r38["removed"] == 2,
+          _r38["removed"])
+    check("撤回的那句话被带了回来 (要放回输入框)", _r38["question"] == "第二问",
+          repr(_r38["question"]))
+    _left38 = _hist38.load_chat(_hcfg38, "2401.1")
+    check("第一问一答原样还在", [m["content"] for m in _left38]
+          == ["第一问", "第一答"], [m["content"] for m in _left38])
+    check("别的论文的讨论**没被动** (只删这篇的)",
+          len(_hist38.load_chat(_hcfg38, "2401.2")) == 1)
+
+    _r38b = _hist38.pop_chat(_hcfg38, "2401.1")
+    check("可以连着退第二问", _r38b["removed"] == 2
+          and _r38b["question"] == "第一问", _r38b)
+    check("退光了", _hist38.load_chat(_hcfg38, "2401.1") == [])
+
+    _r38c = _hist38.pop_chat(_hcfg38, "2401.1")
+    check("没得退时返回 0 而不是抛 (界面靠它弹'没有可撤回的')",
+          _r38c["removed"] == 0 and _r38c["question"] == "", _r38c)
+    check("空 arxiv_id 也不炸",
+          _hist38.pop_chat(_hcfg38, "")["removed"] == 0)
+    check("库文件不存在时返回 0 (不凭空建库)",
+          _hist38.pop_chat({"analysis": {"history_db":
+                                         os.path.join(_tmp38, "没有.sqlite")}},
+                           "2401.1")["removed"] == 0
+          and not os.path.exists(os.path.join(_tmp38, "没有.sqlite")))
+
+    # 只有问、还没有答的时候 (AI 那边还没回来) 也要能退
+    _hist38.append_chat(_hcfg38, "2401.3", "user", "孤零零的一问")
+    _r38d = _hist38.pop_chat(_hcfg38, "2401.3")
+    check("只有问没有答时也能退", _r38d["removed"] == 1
+          and _r38d["question"] == "孤零零的一问", _r38d)
+finally:
+    shutil.rmtree(_tmp38, ignore_errors=True)
+
 print()
 print("=" * 70)
 if FAIL:

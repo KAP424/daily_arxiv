@@ -23,6 +23,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 FAIL = []
 CALLS = []
+DROPPED = []        # 被客户端中途掐断的连接 (见 Handler._push)
 
 
 def check(name, cond, detail=""):
@@ -76,12 +77,27 @@ def reply_for(user_text):
     return {"ok": True}
 
 
+def _sse(obj):
+    """一条 SSE 事件。``ensure_ascii=False`` 是关键: 中文要按 UTF-8 原样发出去,
+    才能验出"客户端有没有按 UTF-8 解码" (SSE 的 Content-Type 不带 charset,
+    requests 默认会按 ISO-8859-1 解, 中文就乱码了)。"""
+    return ("data: " + json.dumps(obj, ensure_ascii=False) + "\n\n").encode("utf-8")
+
+
+def _pieces(text, n=4):
+    """把一段话切成 n 片, 模拟流式增量。"""
+    step = max(1, len(text) // n)
+    return [text[i:i + step] for i in range(0, len(text), step)] or [text]
+
+
 class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         n = int(self.headers.get("Content-Length") or 0)
         body = json.loads(self.rfile.read(n).decode("utf-8"))
         user_text = "\n".join(m.get("content", "") for m in body.get("messages", []))
         CALLS.append(self.path)
+        if body.get("stream"):
+            return self._stream(reply_for(user_text))
         payload = reply_for(user_text)
         if isinstance(payload, str):
             text = payload              # 聊天要的就是一段人话, 不套 JSON 围栏
@@ -100,6 +116,44 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(out)))
         self.end_headers()
         self.wfile.write(out)
+
+    # SSE 分支: 先吐几段思考 (reasoning_content), 再吐正文 (content)。
+    def _stream(self, payload):
+        fence = chr(96) * 3
+        if isinstance(payload, str):
+            text = payload
+        else:
+            text = fence + "json\n" + json.dumps(payload,
+                                                 ensure_ascii=False) + "\n" + fence
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.end_headers()
+        # 先来几段思考 (reasoning_content), 再来正文 (content) —— 和推理模型的实际
+        # 形状一致, 也是界面"思考灰字 → 正文开始就收起"那条路的输入。
+        for piece in _pieces("假服务的思考过程: 先看符号问题, 再想怎么绕过去。"):
+            if not self._push({"choices": [{"delta": {
+                    "reasoning_content": piece}}]}):
+                return
+        for piece in _pieces(text):
+            if not self._push({"choices": [{"delta": {"content": piece}}]}):
+                return
+        self._push({"choices": [{"delta": {}, "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 100, "completion_tokens": 50}})
+
+    def _push(self, obj):
+        """写一条事件。返回 False 表示客户端已经断开了 (点了"停止")。
+
+        记一笔到 ``DROPPED``: 自检靠它断言"服务端确实是被断开的那一方", 而不是
+        客户端自己把结果丢了 —— 那两件事在界面上看起来一样。
+        """
+        try:
+            self.wfile.write(_sse(obj))
+            self.wfile.flush()
+            time.sleep(0.02)
+            return True
+        except Exception:
+            DROPPED.append(self.path)
+            return False
 
     def log_message(self, *a):
         pass
@@ -267,6 +321,7 @@ print("=" * 70)
 from arxiv_rec import chat as _chat
 from arxiv_rec import history as _hist
 from arxiv_rec.ai import build_client
+from arxiv_rec import ai as _ai_module
 from arxiv_rec.models import Candidate as _Cand
 from arxiv_rec.models import LibraryPaper as _Paper
 
@@ -353,6 +408,61 @@ check("写回的解读下一轮能被复用 (画像没变)",
 check("画像变了就不复用",
       not _hist.RecommendHistory.reuse_analysis(
           _Cand(arxiv_id="2401.90001", title=_talk.title), _row1, "fp-别的"))
+
+# ---------------------------------------------------------------------------
+# 流式: 走真的 HTTP, 真读 SSE, 真的中途掐断
+# ---------------------------------------------------------------------------
+print()
+print("=" * 70)
+print("流式讨论 (on_delta / stop_event)")
+print("=" * 70)
+
+_saw = []
+_ai2 = _ai_module.build_client(cfg, None)
+_text = _ai2.chat("系统提示", "继续讨论: 这个变换在小格点上还成立吗?", use_cache=False,
+                  on_delta=lambda kind, piece, secs: _saw.append((kind, piece)))
+check("流式拿到了正文", "假服务: 它先做了一个规范变换" in _text, _text[:80])
+check("流式把思考单独标了出来 (没混进正文)",
+      any(k == "thinking" for k, _ in _saw), _saw[:3])
+check("流式把正文标成了 answer",
+      any(k == "answer" for k, _ in _saw), _saw[:3])
+check("思考没有混进返回的正文里",
+      "假服务的思考过程" not in _text, _text[:80])
+check("流式返回的正文和阻塞式那次一致 (两条路解析的是同一份内容)",
+      _text == _ans, (_text[:40], _ans[:40]))
+check("中文没有乱码 (SSE 的 Content-Type 不带 charset, 得手动按 UTF-8 解)",
+      "规范变换" in _text and "锟" not in _text, _text[:80])
+check("流式累加了 token 用量", _ai2.total_tokens > 0, _ai2.total_tokens)
+
+# --- 中途停止: 服务端那边必须真的被断开 ---
+import threading as _th
+_stop = _th.Event()
+_seen = []
+_ai3 = _ai_module.build_client(cfg, None)
+
+
+def _on_delta(kind, piece, secs):
+    _seen.append(piece)
+    if len(_seen) >= 2:
+        _stop.set()          # 收够两段就按"停止"
+
+
+try:
+    _ai3.chat("系统提示", "继续讨论: 这个变换在小格点上还成立吗?", use_cache=False,
+              on_delta=_on_delta, stop_event=_stop)
+    check("中途停止会抛 AIStopped", False, "没抛, 正常答完了")
+except _ai_module.AIStopped:
+    check("中途停止会抛 AIStopped", True)
+except Exception as _exc:
+    check("中途停止会抛 AIStopped", False, "%s: %s" % (type(_exc).__name__, _exc))
+
+# 服务端那边记到"写不进去"才算真断开 —— 否则只是客户端把结果丢了,
+# 那是两回事 (后者在界面上看着一样, 但后台那次请求会一直跑完)。
+_deadline = time.time() + 3.0
+while not DROPPED and time.time() < _deadline:
+    time.sleep(0.05)
+check("停止之后服务端确实写不动了 (连接真断了, 不是客户端把结果丢掉)",
+      bool(DROPPED), DROPPED)
 
 srv.shutdown()
 shutil.rmtree(tmpdir, ignore_errors=True)

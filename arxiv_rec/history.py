@@ -477,6 +477,45 @@ class RecommendHistory:
             log("清空讨论记录失败 (%s): %s" % (aid, exc), "warn")
             return 0
 
+    def pop_last_turn(self, arxiv_id: str) -> Dict[str, Any]:
+        """撤回**最后一问**: 删掉最后一条 user 消息, 以及它之后的全部内容。
+
+        返回 ``{"removed": 删了几条, "question": 撤回的那句提问}``。提问原文要带
+        回给界面 —— 它把这句话塞回输入框, 用户改几个字就能重发, 这才是"回退上一
+        次提问"的完整意思 (见 ui.py 的 withdraw_chat)。
+
+        范围只认最后一条 user 消息及之后, 所以 AI 已经给出的回答跟着一起走: 留着
+        它就成了一条没有问题的回答。没有 user 消息 (或者压根没聊过) 时返回 0, 一
+        条都不删 —— 不用额外判断, ``MAX(id)`` 为 NULL 时 ``id >= NULL`` 恒不成立。
+        """
+        aid = str(arxiv_id or "").strip()
+        if not aid:
+            return {"removed": 0, "question": ""}
+        try:
+            row = self.conn.execute(
+                "SELECT MAX(id) AS last FROM chat "
+                "WHERE arxiv_id = ? AND role = 'user'", (aid,)).fetchone()
+            # 把这个边界先取成一个具体的 id, 后面两条语句都用它。写成子查询让
+            # 它被重算的话, SELECT 和 DELETE 看到的前提未必是同一个 —— 中间夹
+            # 进来的那条 INSERT 会让"删掉的东西"和"报告删掉的东西"对不上。
+            last = row["last"] if row is not None else None
+            if last is None:
+                return {"removed": 0, "question": ""}
+            rows = [dict(r) for r in self.conn.execute(
+                "SELECT role, content FROM chat WHERE arxiv_id = ? AND id >= ? "
+                "ORDER BY id", (aid, int(last)))]
+            cur = self.conn.execute(
+                "DELETE FROM chat WHERE arxiv_id = ? AND id >= ?", (aid, int(last)))
+            self.conn.commit()
+        except Exception as exc:
+            log("撤回上一问失败 (%s): %s" % (aid, exc), "warn")
+            return {"removed": 0, "question": ""}
+        question = ""
+        for r in rows:
+            if str(r.get("role") or "") == "user":
+                question = str(r.get("content") or "")
+        return {"removed": int(cur.rowcount or 0), "question": question}
+
     def save_analysis(self, arxiv_id: str, summary: str, connections: Any = None,
                       ideas: str = "", profile_fp: str = "",
                       title: str = "", report: str = "") -> bool:
@@ -901,6 +940,24 @@ def clear_chat(cfg: Dict[str, Any], arxiv_id: str) -> int:
     except Exception as exc:
         log("清空讨论记录失败: %s" % exc, "warn")
         return 0
+
+
+def pop_chat(cfg: Dict[str, Any], arxiv_id: str) -> Dict[str, Any]:
+    """撤回最后一问, 返回 ``{"removed": n, "question": 那句提问}``。
+
+    库文件不在就返回空的 —— 和 load_chat 同一条规矩: 看一眼、点一下都不该在用户
+    盘上凭空多出一个 sqlite 文件。
+    """
+    aid = str(arxiv_id or "").strip()
+    path = history_path(cfg)
+    if not aid or not os.path.exists(path):
+        return {"removed": 0, "question": ""}
+    try:
+        with RecommendHistory(path) as h:
+            return h.pop_last_turn(aid)
+    except Exception as exc:
+        log("撤回上一问失败: %s" % exc, "warn")
+        return {"removed": 0, "question": ""}
 
 
 def save_analysis(cfg: Dict[str, Any], cand: Any, profile_fp: str = "",

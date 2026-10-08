@@ -10,7 +10,11 @@
     "max_tokens": 4096,
     "timeout": 240,
     "max_retries": 3,
-    "_说明": "provider 可选 openai(兼容 DeepSeek/Qwen/Kimi/智谱/本地vLLM等) 或 anthropic"
+    "reasoning_effort": "",
+    "extra_body": {},
+    "_说明": "provider 可选 openai(兼容 DeepSeek/Qwen/Kimi/智谱/本地vLLM等) 或 anthropic",
+    "_reasoning_effort": "思考程度, 打分/深度解读/讨论都用它。留空 = 什么都不发, 由服务端按自己的默认来。可选 none(不思考) / low / medium / high。接口不认这个参数时会自动去掉重发一次, 所以填了不会把请求搞坏。注意: 它进了 AI 响应的磁盘缓存键, 所以改档位之后第一次跑推荐会重新调用 AI。DeepSeek 把 medium 当 high。",
+    "_extra_body": "逃生口: 直接并进请求体的额外字段 (JSON 对象)。网关有自己一套字段时用。例: {\"thinking\": {\"type\": \"enabled\"}}"
   },
   "arxiv": {
     "queries": [],
